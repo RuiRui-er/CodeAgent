@@ -2,7 +2,8 @@
 
 这是一个刻意保持简单的 Coding Agent。它不使用 LangChain、OpenAI Agents SDK、
 AutoGen 等 Agent 框架或 SDK；Agent 循环、消息历史、工具定义与执行、结果回传、
-终止条件和错误处理均在 `coding_agent.py` 中自行实现。
+终止条件和错误处理均自行实现。状态数据与上下文选择分别拆分在
+`agent_state.py` 和 `context_manager.py`，入口循环仍位于 `coding_agent.py`。
 
 ## 运行环境
 
@@ -34,7 +35,8 @@ python coding_agent.py --workspace demo_project "阅读项目，定位并修复�
 4. 完整打印规划状态，然后进入原有执行循环；
 5. 模型使用全部工具实施计划，直到给出结论或达到最大步数。
 
-程序会逐步打印模型消息、工具名、参数、执行结果和终止原因。
+程序会逐步打印模型消息、工具名、参数、执行结果和终止原因。每次调用模型前还会打印
+`[Context]`，列出当前 phase、实际包含的 section 和总字符数。
 
 规划结果保存在 `AgentState`，包含 `original_task`、`task_understanding`、
 `acceptance_criteria`、`verification_contract`、`baseline`、`execution_plan` 和
@@ -43,6 +45,26 @@ python coding_agent.py --workspace demo_project "阅读项目，定位并修复�
 
 `--max-planning-steps 8` 可单独限制规划轮数。若模型在限制内没有提交有效结构化计划，
 程序会停止而不会进入执行阶段。
+
+## State-aware Context Management
+
+程序不会把持续增长的完整 `messages` 原样发送给模型。完整 tool/assistant trajectory 在
+当前运行中保留用于日志记录；每次模型请求则由 `ContextManager` 根据 `current_phase`
+重新构造：
+
+- `PLANNING`：任务、验收标准、规划发现和少量最近操作；
+- `EXECUTING`：任务、当前步骤、步骤关联验收标准、最新相关代码、最近操作和失败尝试；
+- `VERIFYING`：验收标准、验证契约、baseline、修改摘要、已完成步骤和最新结果；
+- `DEBUGGING`：任务、当前步骤、失败证据、失败尝试、最新相关代码和最近操作。
+
+各 phase 使用 `PHASE_SECTION_BUDGETS` 中固定、可读的 section 字符上限，并受
+`MAX_CONTEXT_CHARS` 总上限约束；不依赖 tokenizer。`recent_actions` 固定只保留最近
+5 项。重要事实、完成步骤和失败尝试分别增量写入 `confirmed_facts`、
+`completed_steps`、`failed_attempts`，不调用模型生成历史摘要。
+
+`relevant_files` 只保存相对路径，`relevant_symbols` 只保存符号名。构造 EXECUTING 或
+DEBUGGING 上下文时，ContextManager 会从 workspace 重新读取文件并按符号截取附近代码，
+因此磁盘上的当前文件始终是代码内容的唯一真实来源。
 
 ## 本地工具
 
@@ -75,4 +97,11 @@ python -m unittest -v
 
 ```powershell
 python -m unittest -v test_planning.py
+python -m unittest -v test_context_manager.py
+```
+
+离线观察四个 phase 的上下文组成（不调用模型 API，也不修改 demo 文件）：
+
+```powershell
+python demo_context.py
 ```
