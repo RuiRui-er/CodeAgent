@@ -8,6 +8,7 @@ from coding_agent import WorkspaceTools, run_planning
 class FakePlanningClient:
     def __init__(self):
         self.seen_tool_names = []
+        self.message_counts = []
         self.responses = iter([
             {
                 "role": "assistant",
@@ -60,6 +61,7 @@ class FakePlanningClient:
         ])
 
     def complete(self, messages, tool_schemas=None):
+        self.message_counts.append(len(messages))
         self.seen_tool_names = [schema["function"]["name"] for schema in tool_schemas]
         return next(self.responses)
 
@@ -77,6 +79,7 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(state.current_step, "STEP-1")
         self.assertNotIn("write_file", client.seen_tool_names)
         self.assertIn("submit_plan", client.seen_tool_names)
+        self.assertEqual(client.message_counts, [2, 2])
         result = state.baseline[0]["observation"]["result"]
         self.assertNotEqual(result["exit_code"], 0)
         self.assertIn("AssertionError", result["stderr"])
