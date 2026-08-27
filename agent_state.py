@@ -1,0 +1,99 @@
+"""Structured state used to rebuild the model context."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+
+PLANNING = "PLANNING"
+EXECUTING = "EXECUTING"
+VERIFYING = "VERIFYING"
+DEBUGGING = "DEBUGGING"
+PHASES = {PLANNING, EXECUTING, VERIFYING, DEBUGGING}
+
+
+@dataclass(frozen=True)
+class AcceptanceCriterion:
+    id: str
+    description: str
+    criticality: str
+    verification_mode: str
+    evidence_type: str
+    verification_method: str
+
+
+@dataclass(frozen=True)
+class VerificationCheck:
+    id: str
+    description: str
+    verification_mode: str
+    evidence_type: str
+    verification_method: str
+    command: list[str] | None
+    baseline_required: bool
+    related_acceptance_criteria: list[str]
+
+
+@dataclass(frozen=True)
+class ExecutionStep:
+    step_id: str
+    description: str
+    suggested_tools: list[str]
+    related_acceptance_criteria: list[str]
+
+
+@dataclass
+class AgentState:
+    original_task: str
+    current_phase: str = PLANNING
+    task_understanding: str = ""
+    acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
+    verification_contract: list[VerificationCheck] = field(default_factory=list)
+    baseline: list[dict[str, Any]] = field(default_factory=list)
+    execution_plan: list[ExecutionStep] = field(default_factory=list)
+    current_step: str | None = None
+    clarification_needed: str | None = None
+    confirmed_facts: list[str] = field(default_factory=list)
+    completed_steps: list[str] = field(default_factory=list)
+    failed_attempts: list[dict[str, Any]] = field(default_factory=list)
+    failure_evidence: list[dict[str, Any]] = field(default_factory=list)
+    recent_actions: list[dict[str, Any]] = field(default_factory=list)
+    relevant_files: list[str] = field(default_factory=list)
+    relevant_symbols: list[str] = field(default_factory=list)
+
+    def planning_snapshot(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def set_phase(self, phase: str) -> None:
+        if phase not in PHASES:
+            raise ValueError(f"unknown phase: {phase}")
+        self.current_phase = phase
+
+    def add_fact(self, fact: str) -> None:
+        if fact and fact not in self.confirmed_facts:
+            self.confirmed_facts.append(fact)
+
+    def add_relevant_file(self, path: str) -> None:
+        if path and path not in self.relevant_files:
+            self.relevant_files.append(path)
+
+    def add_relevant_symbol(self, symbol: str) -> None:
+        if symbol and symbol not in self.relevant_symbols:
+            self.relevant_symbols.append(symbol)
+
+    def add_action(self, action: dict[str, Any], keep: int = 5) -> None:
+        self.recent_actions.append(action)
+        self.recent_actions[:] = self.recent_actions[-keep:]
+
+    def complete_current_step(self) -> None:
+        if not self.current_step:
+            return
+        if self.current_step not in self.completed_steps:
+            self.completed_steps.append(self.current_step)
+        ids = [step.step_id for step in self.execution_plan]
+        try:
+            index = ids.index(self.current_step)
+        except ValueError:
+            return
+        self.current_step = ids[index + 1] if index + 1 < len(ids) else None

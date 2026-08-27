@@ -9,9 +9,21 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+
+from agent_state import (
+    DEBUGGING,
+    EXECUTING,
+    PLANNING,
+    VERIFYING,
+    AcceptanceCriterion,
+    AgentState,
+    ExecutionStep,
+    VerificationCheck,
+)
+from context_manager import ContextManager
 
 
 SYSTEM_PROMPT = """You are a small coding agent working inside one workspace.
@@ -37,8 +49,8 @@ mark checks that should be run now as baseline_required. Prefer existing tests, 
 minimal reproduction or input/output check, then build/compile and runtime sanity.
 If a missing target check needs a new file, put creation and its pre-fix run before
 product-code changes in the execution plan. Tie every plan step to criterion IDs.
-Do not propose state machines, context budgeting, summaries, structured patches,
-snapshots, Git checkpoints, advanced verification statuses, multiple agents, RAG, or UI.
+Do not propose structured patches, snapshots, Git checkpoints, advanced verification
+statuses, multiple agents, RAG, or UI.
 """
 
 
@@ -193,51 +205,6 @@ SUBMIT_PLAN_SCHEMA = {
         },
     },
 }
-
-
-@dataclass(frozen=True)
-class AcceptanceCriterion:
-    id: str
-    description: str
-    criticality: str
-    verification_mode: str
-    evidence_type: str
-    verification_method: str
-
-
-@dataclass(frozen=True)
-class VerificationCheck:
-    id: str
-    description: str
-    verification_mode: str
-    evidence_type: str
-    verification_method: str
-    command: list[str] | None
-    baseline_required: bool
-    related_acceptance_criteria: list[str]
-
-
-@dataclass(frozen=True)
-class ExecutionStep:
-    step_id: str
-    description: str
-    suggested_tools: list[str]
-    related_acceptance_criteria: list[str]
-
-
-@dataclass
-class AgentState:
-    original_task: str
-    task_understanding: str = ""
-    acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
-    verification_contract: list[VerificationCheck] = field(default_factory=list)
-    baseline: list[dict[str, Any]] = field(default_factory=list)
-    execution_plan: list[ExecutionStep] = field(default_factory=list)
-    current_step: str | None = None
-    clarification_needed: str | None = None
-
-    def planning_snapshot(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 class WorkspaceTools:
@@ -395,7 +362,7 @@ def _parse_tool_arguments(tool_call: dict[str, Any]) -> tuple[dict[str, Any], st
         return {}, f"invalid tool arguments: {exc}"
 
 
-def _validate_plan(payload: dict[str, Any], task: str) -> AgentState:
+def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
     criteria = [AcceptanceCriterion(**item) for item in payload["acceptance_criteria"]]
     checks = [VerificationCheck(**item) for item in payload["verification_contract"]]
     steps = [ExecutionStep(**item) for item in payload["execution_plan"]]
@@ -433,15 +400,106 @@ def _validate_plan(payload: dict[str, Any], task: str) -> AgentState:
         raise ValueError("every acceptance criterion must be covered by the verification contract")
     if planned_criteria != known:
         raise ValueError("every acceptance criterion must be covered by the execution plan")
-    return AgentState(
-        original_task=task,
-        task_understanding=payload["task_understanding"],
-        acceptance_criteria=criteria,
-        verification_contract=checks,
-        execution_plan=steps,
-        current_step=steps[0].step_id,
-        clarification_needed=payload.get("clarification_needed"),
-    )
+    state.task_understanding = payload["task_understanding"]
+    state.acceptance_criteria = criteria
+    state.verification_contract = checks
+    state.execution_plan = steps
+    state.current_step = steps[0].step_id
+    state.clarification_needed = payload.get("clarification_needed")
+    return state
+
+
+def _shorten(text: str, limit: int = 1200) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "... [truncated in action record]"
+
+
+def _compact_observation(name: str, result: dict[str, Any]) -> dict[str, Any]:
+    if not result.get("ok"):
+        return {"ok": False, "error": _shorten(str(result.get("error", "unknown error")))}
+    value = result.get("result", {})
+    if name == "read_file":
+        content = value.get("content", "")
+        return {"ok": True, "path": value.get("path"), "chars": len(content), "preview": _shorten(content)}
+    if name == "list_files":
+        items = value.get("items", [])
+        return {"ok": True, "item_count": len(items), "items": items[:40]}
+    if name == "search_text":
+        matches = value.get("matches", [])
+        return {"ok": True, "match_count": len(matches), "matches": matches[:30]}
+    if name == "run_command":
+        return {
+            "ok": True,
+            "exit_code": value.get("exit_code"),
+            "stdout": _shorten(value.get("stdout", "")),
+            "stderr": _shorten(value.get("stderr", "")),
+        }
+    return value
+
+
+def _record_tool_event(
+    state: AgentState,
+    name: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+    trajectory: list[dict[str, Any]],
+    allow_phase_changes: bool,
+) -> None:
+    trajectory.append({"tool": name, "arguments": arguments, "result": result})
+    state.add_action({
+        "tool": name,
+        "arguments": arguments,
+        "observation": _compact_observation(name, result),
+    })
+
+    if name == "read_file" and result.get("ok"):
+        state.add_relevant_file(str(arguments.get("path", "")))
+    elif name == "search_text" and result.get("ok"):
+        state.add_relevant_symbol(str(arguments.get("query", "")))
+        for match in result.get("result", {}).get("matches", []):
+            state.add_relevant_file(str(match.get("path", "")))
+    elif name == "list_files" and result.get("ok"):
+        count = len(result.get("result", {}).get("items", []))
+        state.add_fact(f"Project structure inspected; {count} entries observed.")
+    elif name == "write_file" and result.get("ok"):
+        path = str(result.get("result", {}).get("path", arguments.get("path", "")))
+        state.add_relevant_file(path)
+        state.add_fact(f"Updated {path} in the workspace.")
+
+    if allow_phase_changes and name != "run_command" and not result.get("ok"):
+        reason = _shorten(str(result.get("error", "unknown tool error")))
+        state.failed_attempts.append({"attempt": f"{name} {arguments}", "reason": reason})
+        state.failure_evidence.append({"tool": name, "arguments": arguments, "error": reason})
+        state.set_phase(DEBUGGING)
+
+    if not allow_phase_changes or name != "run_command":
+        return
+    command = arguments.get("args", [])
+    command_text = " ".join(command) if isinstance(command, list) else str(command)
+    command_result = result.get("result", {}) if result.get("ok") else {}
+    exit_code = command_result.get("exit_code")
+    if result.get("ok") and exit_code == 0:
+        completed = state.current_step
+        state.add_fact(f"Command succeeded: {command_text}")
+        state.complete_current_step()
+        if completed:
+            state.add_fact(f"Completed execution step {completed}.")
+        state.set_phase(EXECUTING if state.current_step else VERIFYING)
+        return
+
+    evidence = {
+        "command": command,
+        "exit_code": exit_code,
+        "stderr": _shorten(command_result.get("stderr", result.get("error", ""))),
+        "stdout": _shorten(command_result.get("stdout", "")),
+    }
+    state.failed_attempts.append({
+        "attempt": command_text or name,
+        "reason": evidence["stderr"] or f"exit code {exit_code}",
+    })
+    state.failure_evidence.append(evidence)
+    state.set_phase(DEBUGGING)
 
 
 def _capture_baseline(state: AgentState, tools: WorkspaceTools) -> None:
@@ -460,23 +518,20 @@ def run_planning(
     client: OpenAICompatibleClient,
     max_planning_steps: int,
 ) -> AgentState:
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": PLANNING_PROMPT},
-        {"role": "user", "content": task},
-    ]
+    state = AgentState(original_task=task)
+    context_manager = ContextManager(tools.root)
+    trajectory: list[dict[str, Any]] = []
     planning_tools = READ_ONLY_TOOL_SCHEMAS + [SUBMIT_PLAN_SCHEMA]
     for step in range(1, max_planning_steps + 1):
-        log(f"PLANNING STEP {step}/{max_planning_steps}", {"message_count": len(messages)})
+        messages = context_manager.build_messages(state, PLANNING_PROMPT)
+        log(f"PLANNING STEP {step}/{max_planning_steps}", {"trajectory_events": len(trajectory)})
         message = client.complete(messages, planning_tools)
-        messages.append(message)
+        trajectory.append({"assistant": message})
         if message.get("content"):
             log("PLANNING MESSAGE", message["content"])
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
-            messages.append({
-                "role": "user",
-                "content": "Continue environment discovery or call submit_plan with the required structured plan.",
-            })
+            state.add_action({"model_message": message.get("content") or "No tool call returned."})
             continue
         for tool_call in tool_calls:
             name = tool_call.get("function", {}).get("name", "")
@@ -486,7 +541,7 @@ def run_planning(
                 result = {"ok": False, "error": parse_error}
             elif name == "submit_plan":
                 try:
-                    state = _validate_plan(arguments, task)
+                    state = _validate_plan(arguments, state)
                     if not state.clarification_needed:
                         _capture_baseline(state, tools)
                     log("Task Understanding", state.task_understanding)
@@ -500,11 +555,7 @@ def run_planning(
             else:
                 result = tools.call(name, arguments)
             log("PLANNING TOOL RESULT", result)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.get("id", ""),
-                "content": json.dumps(result, ensure_ascii=False),
-            })
+            _record_tool_event(state, name, arguments, result, trajectory, allow_phase_changes=False)
     raise RuntimeError(f"PLANNING did not produce a valid plan in {max_planning_steps} steps")
 
 
@@ -514,25 +565,24 @@ def run_execution(
     client: OpenAICompatibleClient,
     max_steps: int,
 ) -> str:
-    frozen_plan = json.dumps(state.planning_snapshot(), ensure_ascii=False, indent=2)
     execution_prompt = SYSTEM_PROMPT + """
 
 PLANNING is complete. Follow the structured plan below. The acceptance criteria and
 verification contract were fixed before implementation; do not rewrite or weaken
 them. Execute planned pre-change verification setup before product-code changes when
 present. This stage may use all provided tools.
-
-STRUCTURED PLAN:
-""" + frozen_plan
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": execution_prompt},
-        {"role": "user", "content": state.original_task},
-    ]
+The context is rebuilt from structured state before every request. Treat workspace
+files as the only source of truth for current code.
+"""
+    state.set_phase(EXECUTING)
+    context_manager = ContextManager(tools.root)
+    trajectory: list[dict[str, Any]] = []
 
     for step in range(1, max_steps + 1):
-        log(f"STEP {step}/{max_steps} - MODEL REQUEST", {"message_count": len(messages)})
+        messages = context_manager.build_messages(state, execution_prompt)
+        log(f"STEP {step}/{max_steps} - MODEL REQUEST", {"trajectory_events": len(trajectory)})
         message = client.complete(messages)
-        messages.append(message)
+        trajectory.append({"assistant": message})
         if message.get("content"):
             log("MODEL MESSAGE", message["content"])
 
@@ -548,14 +598,14 @@ STRUCTURED PLAN:
             if parse_error:
                 result = {"ok": False, "error": parse_error}
             else:
+                if name == "run_command":
+                    state.set_phase(VERIFYING)
+                elif name == "write_file":
+                    state.set_phase(EXECUTING)
                 log("TOOL CALL", {"name": name, "arguments": arguments})
                 result = tools.call(name, arguments)
             log("TOOL RESULT", result)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.get("id", ""),
-                "content": json.dumps(result, ensure_ascii=False),
-            })
+            _record_tool_event(state, name, arguments, result, trajectory, allow_phase_changes=True)
 
     final = f"Stopped after reaching the maximum of {max_steps} steps."
     log("AGENT STOPPED", final)
