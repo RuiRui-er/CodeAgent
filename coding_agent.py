@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -24,13 +23,19 @@ from agent_state import (
     VerificationCheck,
 )
 from context_manager import ContextManager
+from tool_executor import ToolExecutor
+from tool_registry import tool_schemas_for_phase
+
+# Import compatibility for callers of the earlier single-file implementation.
+WorkspaceTools = ToolExecutor
 
 
 SYSTEM_PROMPT = """You are a small coding agent working inside one workspace.
 Solve the user's task autonomously. Inspect relevant files before editing, make the
 smallest useful change, and run an appropriate command or test to verify it.
 Use only the provided tools. Never try to access anything outside the workspace.
-When the task is complete, respond with a concise summary and verification result.
+When implementation is ready for verification, call finish. finish only requests a
+transition to VERIFYING and never means the task is already done.
 If a tool fails, inspect its error and decide how to recover.
 """
 
@@ -53,90 +58,6 @@ Do not propose structured patches, snapshots, Git checkpoints, advanced verifica
 statuses, multiple agents, RAG, or UI.
 """
 
-
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": "List files and directories inside the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Relative directory; default is workspace root."},
-                    "recursive": {"type": "boolean", "description": "List recursively."},
-                },
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a UTF-8 text file in the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Create or replace a UTF-8 text file in the workspace. Use the full desired content.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-                "required": ["path", "content"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_text",
-            "description": "Search for a literal string in workspace text files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "path": {"type": "string", "description": "Relative file or directory; default is root."},
-                },
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_command",
-            "description": "Run a command in the workspace. Pass argv as a JSON array, without shell syntax.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "args": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                    "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
-                },
-                "required": ["args"],
-                "additionalProperties": False,
-            },
-        },
-    },
-]
-
-READ_ONLY_TOOL_SCHEMAS = [
-    schema for schema in TOOL_SCHEMAS
-    if schema["function"]["name"] in {"list_files", "read_file", "search_text", "run_command"}
-]
 
 SUBMIT_PLAN_SCHEMA = {
     "type": "function",
@@ -207,101 +128,6 @@ SUBMIT_PLAN_SCHEMA = {
 }
 
 
-class WorkspaceTools:
-    """Local tools whose direct file operations are confined to one root."""
-
-    def __init__(self, root: Path):
-        self.root = root.resolve(strict=True)
-
-    def _resolve(self, relative: str = ".") -> Path:
-        candidate = (self.root / relative).resolve()
-        try:
-            candidate.relative_to(self.root)
-        except ValueError as exc:
-            raise ValueError(f"path escapes workspace: {relative!r}") from exc
-        return candidate
-
-    def list_files(self, path: str = ".", recursive: bool = False) -> dict[str, Any]:
-        base = self._resolve(path)
-        if not base.is_dir():
-            raise ValueError(f"not a directory: {path}")
-        entries = base.rglob("*") if recursive else base.iterdir()
-        items = []
-        for item in sorted(entries):
-            kind = "dir" if item.is_dir() else "file"
-            items.append({"path": item.relative_to(self.root).as_posix(), "type": kind})
-        return {"items": items}
-
-    def read_file(self, path: str) -> dict[str, Any]:
-        target = self._resolve(path)
-        if not target.is_file():
-            raise ValueError(f"not a file: {path}")
-        return {"path": path, "content": target.read_text(encoding="utf-8")}
-
-    def write_file(self, path: str, content: str) -> dict[str, Any]:
-        target = self._resolve(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        return {"path": target.relative_to(self.root).as_posix(), "bytes": len(content.encode("utf-8"))}
-
-    def search_text(self, query: str, path: str = ".") -> dict[str, Any]:
-        base = self._resolve(path)
-        files = [base] if base.is_file() else (p for p in base.rglob("*") if p.is_file())
-        matches: list[dict[str, Any]] = []
-        for file in files:
-            try:
-                lines = file.read_text(encoding="utf-8").splitlines()
-            except (UnicodeDecodeError, OSError):
-                continue
-            for number, line in enumerate(lines, 1):
-                if query in line:
-                    matches.append({
-                        "path": file.relative_to(self.root).as_posix(),
-                        "line": number,
-                        "text": line,
-                    })
-                if len(matches) >= 200:
-                    return {"matches": matches, "truncated": True}
-        return {"matches": matches, "truncated": False}
-
-    def run_command(self, args: list[str], timeout: int = 30) -> dict[str, Any]:
-        if not args or not all(isinstance(arg, str) for arg in args):
-            raise ValueError("args must be a non-empty list of strings")
-        timeout = max(1, min(int(timeout), 120))
-        # shell=False prevents pipes, redirections, command chaining, and shell built-ins.
-        completed = subprocess.run(
-            args,
-            cwd=self.root,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-            shell=False,
-        )
-        return {
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "exit_code": completed.returncode,
-        }
-
-    def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        methods = {
-            "list_files": self.list_files,
-            "read_file": self.read_file,
-            "write_file": self.write_file,
-            "search_text": self.search_text,
-            "run_command": self.run_command,
-        }
-        try:
-            if name not in methods:
-                raise ValueError(f"unknown tool: {name}")
-            return {"ok": True, "result": methods[name](**arguments)}
-        except subprocess.TimeoutExpired as exc:
-            return {"ok": False, "error": f"command timed out after {exc.timeout} seconds"}
-        except Exception as exc:  # Tool failures become observations for the model.
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-
 class OpenAICompatibleClient:
     """Tiny Chat Completions client implemented with the Python standard library."""
 
@@ -317,12 +143,14 @@ class OpenAICompatibleClient:
         messages: list[dict[str, Any]],
         tool_schemas: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        body = json.dumps({
+        body_data: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "tools": tool_schemas or TOOL_SCHEMAS,
-            "tool_choice": "auto",
-        }).encode("utf-8")
+        }
+        if tool_schemas:
+            body_data["tools"] = tool_schemas
+            body_data["tool_choice"] = "auto"
+        body = json.dumps(body_data).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=body,
@@ -416,26 +244,30 @@ def _shorten(text: str, limit: int = 1200) -> str:
 
 
 def _compact_observation(name: str, result: dict[str, Any]) -> dict[str, Any]:
-    if not result.get("ok"):
-        return {"ok": False, "error": _shorten(str(result.get("error", "unknown error")))}
-    value = result.get("result", {})
+    status = result.get("status", "UNKNOWN")
+    if status != "SUCCESS":
+        return {
+            "status": status,
+            "reason": _shorten(str(result.get("reason", result.get("stderr", "unknown error")))),
+        }
     if name == "read_file":
-        content = value.get("content", "")
-        return {"ok": True, "path": value.get("path"), "chars": len(content), "preview": _shorten(content)}
-    if name == "list_files":
-        items = value.get("items", [])
-        return {"ok": True, "item_count": len(items), "items": items[:40]}
-    if name == "search_text":
-        matches = value.get("matches", [])
-        return {"ok": True, "match_count": len(matches), "matches": matches[:30]}
+        content = result.get("content", "")
+        return {"status": status, "path": result.get("path"), "chars": len(content), "preview": _shorten(content)}
+    if name == "list_dir":
+        items = result.get("items", [])
+        return {"status": status, "item_count": len(items), "items": items[:40]}
+    if name == "search_code":
+        matches = result.get("matches", [])
+        return {"status": status, "match_count": len(matches), "matches": matches[:30]}
     if name == "run_command":
         return {
-            "ok": True,
-            "exit_code": value.get("exit_code"),
-            "stdout": _shorten(value.get("stdout", "")),
-            "stderr": _shorten(value.get("stderr", "")),
+            "status": status,
+            "policy": result.get("policy"),
+            "exit_code": result.get("exit_code"),
+            "stdout": _shorten(result.get("stdout", "")),
+            "stderr": _shorten(result.get("stderr", "")),
         }
-    return value
+    return result
 
 
 def _record_tool_event(
@@ -453,61 +285,33 @@ def _record_tool_event(
         "observation": _compact_observation(name, result),
     })
 
-    if name == "read_file" and result.get("ok"):
+    succeeded = result.get("status") == "SUCCESS"
+    if name == "read_file" and succeeded:
         state.add_relevant_file(str(arguments.get("path", "")))
-    elif name == "search_text" and result.get("ok"):
+    elif name == "search_code" and succeeded:
         state.add_relevant_symbol(str(arguments.get("query", "")))
-        for match in result.get("result", {}).get("matches", []):
+        for match in result.get("matches", []):
             state.add_relevant_file(str(match.get("path", "")))
-    elif name == "list_files" and result.get("ok"):
-        count = len(result.get("result", {}).get("items", []))
-        state.add_fact(f"Project structure inspected; {count} entries observed.")
-    elif name == "write_file" and result.get("ok"):
-        path = str(result.get("result", {}).get("path", arguments.get("path", "")))
+    elif name in {"apply_patch", "write_file"} and succeeded:
+        path = str(result.get("path", arguments.get("path", "")))
         state.add_relevant_file(path)
-        state.add_fact(f"Updated {path} in the workspace.")
+        state.add_fact(f"A {name} mutation succeeded for {path}.")
+    elif name == "finish" and succeeded:
+        state.complete_current_step()
 
-    if allow_phase_changes and name != "run_command" and not result.get("ok"):
-        reason = _shorten(str(result.get("error", "unknown tool error")))
+    failure_statuses = {"FAILED", "TIMEOUT"}
+    if allow_phase_changes and result.get("status") in failure_statuses:
+        reason = _shorten(str(result.get("reason", result.get("stderr", "unknown tool error"))))
         state.failed_attempts.append({"attempt": f"{name} {arguments}", "reason": reason})
         state.failure_evidence.append({"tool": name, "arguments": arguments, "error": reason})
         state.set_phase(DEBUGGING)
-
-    if not allow_phase_changes or name != "run_command":
-        return
-    command = arguments.get("args", [])
-    command_text = " ".join(command) if isinstance(command, list) else str(command)
-    command_result = result.get("result", {}) if result.get("ok") else {}
-    exit_code = command_result.get("exit_code")
-    if result.get("ok") and exit_code == 0:
-        completed = state.current_step
-        state.add_fact(f"Command succeeded: {command_text}")
-        state.complete_current_step()
-        if completed:
-            state.add_fact(f"Completed execution step {completed}.")
-        state.set_phase(EXECUTING if state.current_step else VERIFYING)
-        return
-
-    evidence = {
-        "command": command,
-        "exit_code": exit_code,
-        "stderr": _shorten(command_result.get("stderr", result.get("error", ""))),
-        "stdout": _shorten(command_result.get("stdout", "")),
-    }
-    state.failed_attempts.append({
-        "attempt": command_text or name,
-        "reason": evidence["stderr"] or f"exit code {exit_code}",
-    })
-    state.failure_evidence.append(evidence)
-    state.set_phase(DEBUGGING)
-
 
 def _capture_baseline(state: AgentState, tools: WorkspaceTools) -> None:
     for check in state.verification_contract:
         if not check.baseline_required or check.verification_mode != "AUTO" or not check.command:
             continue
         log("BASELINE CHECK", {"id": check.id, "command": check.command})
-        observation = tools.call("run_command", {"args": check.command})
+        observation = tools.call(state, "run_command", {"command": check.command})
         state.baseline.append({"verification_id": check.id, "observation": observation})
         log("BASELINE RESULT", state.baseline[-1])
 
@@ -521,7 +325,7 @@ def run_planning(
     state = AgentState(original_task=task)
     context_manager = ContextManager(tools.root)
     trajectory: list[dict[str, Any]] = []
-    planning_tools = READ_ONLY_TOOL_SCHEMAS + [SUBMIT_PLAN_SCHEMA]
+    planning_tools = tool_schemas_for_phase(PLANNING) + [SUBMIT_PLAN_SCHEMA]
     for step in range(1, max_planning_steps + 1):
         messages = context_manager.build_messages(state, PLANNING_PROMPT)
         log(f"PLANNING STEP {step}/{max_planning_steps}", {"trajectory_events": len(trajectory)})
@@ -538,7 +342,7 @@ def run_planning(
             arguments, parse_error = _parse_tool_arguments(tool_call)
             log("PLANNING TOOL CALL", {"name": name, "arguments": arguments})
             if parse_error:
-                result = {"ok": False, "error": parse_error}
+                result = {"status": "FAILED", "tool": name, "reason": parse_error}
             elif name == "submit_plan":
                 try:
                     state = _validate_plan(arguments, state)
@@ -551,9 +355,9 @@ def run_planning(
                     log("Execution Plan", [asdict(item) for item in state.execution_plan])
                     return state
                 except (KeyError, TypeError, ValueError) as exc:
-                    result = {"ok": False, "error": f"invalid plan: {exc}"}
+                    result = {"status": "FAILED", "tool": name, "reason": f"invalid plan: {exc}"}
             else:
-                result = tools.call(name, arguments)
+                result = tools.call(state, name, arguments)
             log("PLANNING TOOL RESULT", result)
             _record_tool_event(state, name, arguments, result, trajectory, allow_phase_changes=False)
     raise RuntimeError(f"PLANNING did not produce a valid plan in {max_planning_steps} steps")
@@ -581,29 +385,32 @@ files as the only source of truth for current code.
     for step in range(1, max_steps + 1):
         messages = context_manager.build_messages(state, execution_prompt)
         log(f"STEP {step}/{max_steps} - MODEL REQUEST", {"trajectory_events": len(trajectory)})
-        message = client.complete(messages)
+        message = client.complete(messages, tool_schemas_for_phase(state.current_phase))
         trajectory.append({"assistant": message})
         if message.get("content"):
             log("MODEL MESSAGE", message["content"])
 
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
-            final = message.get("content") or "Model stopped without a final message."
-            log("AGENT FINISHED", final)
-            return final
+            content = message.get("content") or "Model returned no tool call."
+            if state.current_phase == VERIFYING:
+                final = f"Verification phase reached (final verification status is not implemented yet): {content}"
+                log("AGENT STOPPED", final)
+                return final
+            state.add_action({
+                "model_message": content,
+                "observation": "Call finish to request transition into VERIFYING.",
+            })
+            continue
 
         for tool_call in tool_calls:
             name = tool_call.get("function", {}).get("name", "")
             arguments, parse_error = _parse_tool_arguments(tool_call)
             if parse_error:
-                result = {"ok": False, "error": parse_error}
+                result = {"status": "FAILED", "tool": name, "reason": parse_error}
             else:
-                if name == "run_command":
-                    state.set_phase(VERIFYING)
-                elif name == "write_file":
-                    state.set_phase(EXECUTING)
                 log("TOOL CALL", {"name": name, "arguments": arguments})
-                result = tools.call(name, arguments)
+                result = tools.call(state, name, arguments)
             log("TOOL RESULT", result)
             _record_tool_event(state, name, arguments, result, trajectory, allow_phase_changes=True)
 

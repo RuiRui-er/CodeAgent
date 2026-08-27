@@ -16,7 +16,7 @@ class FakePlanningClient:
                 "tool_calls": [{
                     "id": "call-1",
                     "type": "function",
-                    "function": {"name": "list_files", "arguments": "{\"recursive\": true}"},
+                    "function": {"name": "list_dir", "arguments": "{\"max_depth\": 3}"},
                 }],
             },
             {
@@ -80,7 +80,7 @@ class PlanningTests(unittest.TestCase):
         self.assertNotIn("write_file", client.seen_tool_names)
         self.assertIn("submit_plan", client.seen_tool_names)
         self.assertEqual(client.message_counts, [2, 2])
-        result = state.baseline[0]["observation"]["result"]
+        result = state.baseline[0]["observation"]
         self.assertNotEqual(result["exit_code"], 0)
         self.assertIn("AssertionError", result["stderr"])
 
