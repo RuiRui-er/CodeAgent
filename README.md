@@ -28,12 +28,21 @@ python coding_agent.py --workspace demo_project "阅读项目，定位并修复�
 
 ## Agent 闭环
 
-1. 把用户任务、系统提示、工具定义发送给模型；
-2. 模型自主选择工具及参数；
-3. 本地执行工具，将真实结果作为 tool message 追加到对话；
-4. 再次调用模型，直到模型不再调用工具并给出结论，或达到最大步数。
+1. 进入 `PLANNING`，模型只使用浏览、读取、搜索和命令工具理解项目；
+2. 模型通过 `submit_plan` 生成结构化验收标准、验证契约和执行计划；
+3. 程序在修改前执行契约中标记的 baseline 检查并保存结果；
+4. 完整打印规划状态，然后进入原有执行循环；
+5. 模型使用全部工具实施计划，直到给出结论或达到最大步数。
 
 程序会逐步打印模型消息、工具名、参数、执行结果和终止原因。
+
+规划结果保存在 `AgentState`，包含 `original_task`、`task_understanding`、
+`acceptance_criteria`、`verification_contract`、`baseline`、`execution_plan` 和
+`current_step`。验收标准和验证契约在进入执行阶段前确定，执行提示明确禁止模型为了
+适配实现而削弱它们。本阶段只区分 planning 与 execution，没有引入完整状态机。
+
+`--max-planning-steps 8` 可单独限制规划轮数。若模型在限制内没有提交有效结构化计划，
+程序会停止而不会进入执行阶段。
 
 ## 本地工具
 
@@ -61,3 +70,9 @@ python -m unittest -v
 ```
 
 若要重复演示，请先把 `calculator.py` 中的返回表达式恢复成 `count / total`。
+
+运行规划数据结构与 baseline 的离线单元测试（不调用模型 API）：
+
+```powershell
+python -m unittest -v test_planning.py
+```

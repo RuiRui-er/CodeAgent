@@ -9,6 +9,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,25 @@ smallest useful change, and run an appropriate command or test to verify it.
 Use only the provided tools. Never try to access anything outside the workspace.
 When the task is complete, respond with a concise summary and verification result.
 If a tool fails, inspect its error and decide how to recover.
+"""
+
+PLANNING_PROMPT = """You are in the PLANNING phase of a small coding agent.
+Understand the user's task before any product-code modification. Use the read-only
+exploration tools to inspect the project structure, README, tests, configuration,
+relevant source, and current failures. Prefer resolving ambiguity from the workspace.
+Only report that clarification is needed when the real intent cannot be inferred and
+different interpretations would produce materially different implementations.
+
+When sufficiently informed, call submit_plan exactly once. Acceptance criteria must
+be observable and task-specific. Every AUTO criterion needs a concrete verification
+method (an exact test, command, input/output case, build, or runtime check), never a
+generic phrase such as 'check correctness'. Define verification checks before coding;
+mark checks that should be run now as baseline_required. Prefer existing tests, then a
+minimal reproduction or input/output check, then build/compile and runtime sanity.
+If a missing target check needs a new file, put creation and its pre-fix run before
+product-code changes in the execution plan. Tie every plan step to criterion IDs.
+Do not propose state machines, context budgeting, summaries, structured patches,
+snapshots, Git checkpoints, advanced verification statuses, multiple agents, RAG, or UI.
 """
 
 
@@ -100,6 +120,124 @@ TOOL_SCHEMAS = [
         },
     },
 ]
+
+READ_ONLY_TOOL_SCHEMAS = [
+    schema for schema in TOOL_SCHEMAS
+    if schema["function"]["name"] in {"list_files", "read_file", "search_text", "run_command"}
+]
+
+SUBMIT_PLAN_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "submit_plan",
+        "description": "Finish PLANNING by submitting the structured, pre-change plan.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_understanding": {"type": "string"},
+                "acceptance_criteria": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "description": {"type": "string"},
+                            "criticality": {"type": "string", "enum": ["CRITICAL", "NON_CRITICAL"]},
+                            "verification_mode": {"type": "string", "enum": ["AUTO", "HUMAN"]},
+                            "evidence_type": {"type": "string", "enum": ["TARGET", "REGRESSION", "SANITY"]},
+                            "verification_method": {"type": "string"},
+                        },
+                        "required": ["id", "description", "criticality", "verification_mode", "evidence_type", "verification_method"],
+                        "additionalProperties": False,
+                    },
+                },
+                "verification_contract": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "description": {"type": "string"},
+                            "verification_mode": {"type": "string", "enum": ["AUTO", "HUMAN"]},
+                            "evidence_type": {"type": "string", "enum": ["TARGET", "REGRESSION", "SANITY"]},
+                            "verification_method": {"type": "string"},
+                            "command": {"type": ["array", "null"], "items": {"type": "string"}},
+                            "baseline_required": {"type": "boolean"},
+                            "related_acceptance_criteria": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        },
+                        "required": ["id", "description", "verification_mode", "evidence_type", "verification_method", "command", "baseline_required", "related_acceptance_criteria"],
+                        "additionalProperties": False,
+                    },
+                },
+                "execution_plan": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step_id": {"type": "string"},
+                            "description": {"type": "string"},
+                            "suggested_tools": {"type": "array", "items": {"type": "string"}},
+                            "related_acceptance_criteria": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        },
+                        "required": ["step_id", "description", "suggested_tools", "related_acceptance_criteria"],
+                        "additionalProperties": False,
+                    },
+                },
+                "clarification_needed": {"type": ["string", "null"]},
+            },
+            "required": ["task_understanding", "acceptance_criteria", "verification_contract", "execution_plan", "clarification_needed"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+@dataclass(frozen=True)
+class AcceptanceCriterion:
+    id: str
+    description: str
+    criticality: str
+    verification_mode: str
+    evidence_type: str
+    verification_method: str
+
+
+@dataclass(frozen=True)
+class VerificationCheck:
+    id: str
+    description: str
+    verification_mode: str
+    evidence_type: str
+    verification_method: str
+    command: list[str] | None
+    baseline_required: bool
+    related_acceptance_criteria: list[str]
+
+
+@dataclass(frozen=True)
+class ExecutionStep:
+    step_id: str
+    description: str
+    suggested_tools: list[str]
+    related_acceptance_criteria: list[str]
+
+
+@dataclass
+class AgentState:
+    original_task: str
+    task_understanding: str = ""
+    acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
+    verification_contract: list[VerificationCheck] = field(default_factory=list)
+    baseline: list[dict[str, Any]] = field(default_factory=list)
+    execution_plan: list[ExecutionStep] = field(default_factory=list)
+    current_step: str | None = None
+    clarification_needed: str | None = None
+
+    def planning_snapshot(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 class WorkspaceTools:
@@ -207,11 +345,15 @@ class OpenAICompatibleClient:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY environment variable is not set")
 
-    def complete(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         body = json.dumps({
             "model": self.model,
             "messages": messages,
-            "tools": TOOL_SCHEMAS,
+            "tools": tool_schemas or TOOL_SCHEMAS,
             "tool_choice": "auto",
         }).encode("utf-8")
         request = urllib.request.Request(
@@ -242,12 +384,149 @@ def log(label: str, value: Any) -> None:
         print(json.dumps(value, ensure_ascii=False, indent=2), flush=True)
 
 
-def run_agent(task: str, workspace: Path, max_steps: int) -> str:
-    tools = WorkspaceTools(workspace)
-    client = OpenAICompatibleClient()
+def _parse_tool_arguments(tool_call: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    raw = tool_call.get("function", {}).get("arguments", "{}")
+    try:
+        arguments = json.loads(raw)
+        if not isinstance(arguments, dict):
+            raise ValueError("tool arguments must decode to an object")
+        return arguments, None
+    except (json.JSONDecodeError, ValueError) as exc:
+        return {}, f"invalid tool arguments: {exc}"
+
+
+def _validate_plan(payload: dict[str, Any], task: str) -> AgentState:
+    criteria = [AcceptanceCriterion(**item) for item in payload["acceptance_criteria"]]
+    checks = [VerificationCheck(**item) for item in payload["verification_contract"]]
+    steps = [ExecutionStep(**item) for item in payload["execution_plan"]]
+    criterion_ids = [item.id for item in criteria]
+    if len(criterion_ids) != len(set(criterion_ids)):
+        raise ValueError("acceptance criterion IDs must be unique")
+    check_ids = [item.id for item in checks]
+    if len(check_ids) != len(set(check_ids)):
+        raise ValueError("verification check IDs must be unique")
+    step_ids = [item.step_id for item in steps]
+    if len(step_ids) != len(set(step_ids)):
+        raise ValueError("execution step IDs must be unique")
+    if any(not item.verification_method.strip() for item in criteria):
+        raise ValueError("every acceptance criterion needs a verification_method")
+    known = set(criterion_ids)
+    for check in checks:
+        if not set(check.related_acceptance_criteria) <= known:
+            raise ValueError(f"verification check {check.id} refers to an unknown criterion")
+        if check.verification_mode == "AUTO" and not check.command:
+            raise ValueError(f"AUTO verification check {check.id} needs a command")
+    for step in steps:
+        if not set(step.related_acceptance_criteria) <= known:
+            raise ValueError(f"execution step {step.step_id} refers to an unknown criterion")
+    verified_criteria = {
+        criterion_id
+        for check in checks
+        for criterion_id in check.related_acceptance_criteria
+    }
+    planned_criteria = {
+        criterion_id
+        for step in steps
+        for criterion_id in step.related_acceptance_criteria
+    }
+    if verified_criteria != known:
+        raise ValueError("every acceptance criterion must be covered by the verification contract")
+    if planned_criteria != known:
+        raise ValueError("every acceptance criterion must be covered by the execution plan")
+    return AgentState(
+        original_task=task,
+        task_understanding=payload["task_understanding"],
+        acceptance_criteria=criteria,
+        verification_contract=checks,
+        execution_plan=steps,
+        current_step=steps[0].step_id,
+        clarification_needed=payload.get("clarification_needed"),
+    )
+
+
+def _capture_baseline(state: AgentState, tools: WorkspaceTools) -> None:
+    for check in state.verification_contract:
+        if not check.baseline_required or check.verification_mode != "AUTO" or not check.command:
+            continue
+        log("BASELINE CHECK", {"id": check.id, "command": check.command})
+        observation = tools.call("run_command", {"args": check.command})
+        state.baseline.append({"verification_id": check.id, "observation": observation})
+        log("BASELINE RESULT", state.baseline[-1])
+
+
+def run_planning(
+    task: str,
+    tools: WorkspaceTools,
+    client: OpenAICompatibleClient,
+    max_planning_steps: int,
+) -> AgentState:
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": PLANNING_PROMPT},
         {"role": "user", "content": task},
+    ]
+    planning_tools = READ_ONLY_TOOL_SCHEMAS + [SUBMIT_PLAN_SCHEMA]
+    for step in range(1, max_planning_steps + 1):
+        log(f"PLANNING STEP {step}/{max_planning_steps}", {"message_count": len(messages)})
+        message = client.complete(messages, planning_tools)
+        messages.append(message)
+        if message.get("content"):
+            log("PLANNING MESSAGE", message["content"])
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            messages.append({
+                "role": "user",
+                "content": "Continue environment discovery or call submit_plan with the required structured plan.",
+            })
+            continue
+        for tool_call in tool_calls:
+            name = tool_call.get("function", {}).get("name", "")
+            arguments, parse_error = _parse_tool_arguments(tool_call)
+            log("PLANNING TOOL CALL", {"name": name, "arguments": arguments})
+            if parse_error:
+                result = {"ok": False, "error": parse_error}
+            elif name == "submit_plan":
+                try:
+                    state = _validate_plan(arguments, task)
+                    if not state.clarification_needed:
+                        _capture_baseline(state, tools)
+                    log("Task Understanding", state.task_understanding)
+                    log("Acceptance Criteria", [asdict(item) for item in state.acceptance_criteria])
+                    log("Verification Contract", [asdict(item) for item in state.verification_contract])
+                    log("Baseline", state.baseline)
+                    log("Execution Plan", [asdict(item) for item in state.execution_plan])
+                    return state
+                except (KeyError, TypeError, ValueError) as exc:
+                    result = {"ok": False, "error": f"invalid plan: {exc}"}
+            else:
+                result = tools.call(name, arguments)
+            log("PLANNING TOOL RESULT", result)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.get("id", ""),
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+    raise RuntimeError(f"PLANNING did not produce a valid plan in {max_planning_steps} steps")
+
+
+def run_execution(
+    state: AgentState,
+    tools: WorkspaceTools,
+    client: OpenAICompatibleClient,
+    max_steps: int,
+) -> str:
+    frozen_plan = json.dumps(state.planning_snapshot(), ensure_ascii=False, indent=2)
+    execution_prompt = SYSTEM_PROMPT + """
+
+PLANNING is complete. Follow the structured plan below. The acceptance criteria and
+verification contract were fixed before implementation; do not rewrite or weaken
+them. Execute planned pre-change verification setup before product-code changes when
+present. This stage may use all provided tools.
+
+STRUCTURED PLAN:
+""" + frozen_plan
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": execution_prompt},
+        {"role": "user", "content": state.original_task},
     ]
 
     for step in range(1, max_steps + 1):
@@ -265,14 +544,9 @@ def run_agent(task: str, workspace: Path, max_steps: int) -> str:
 
         for tool_call in tool_calls:
             name = tool_call.get("function", {}).get("name", "")
-            raw_arguments = tool_call.get("function", {}).get("arguments", "{}")
-            try:
-                arguments = json.loads(raw_arguments)
-                if not isinstance(arguments, dict):
-                    raise ValueError("tool arguments must decode to an object")
-            except (json.JSONDecodeError, ValueError) as exc:
-                arguments = {}
-                result = {"ok": False, "error": f"invalid tool arguments: {exc}"}
+            arguments, parse_error = _parse_tool_arguments(tool_call)
+            if parse_error:
+                result = {"ok": False, "error": parse_error}
             else:
                 log("TOOL CALL", {"name": name, "arguments": arguments})
                 result = tools.call(name, arguments)
@@ -288,11 +562,25 @@ def run_agent(task: str, workspace: Path, max_steps: int) -> str:
     return final
 
 
+def run_agent(task: str, workspace: Path, max_steps: int, max_planning_steps: int = 8) -> str:
+    tools = WorkspaceTools(workspace)
+    client = OpenAICompatibleClient()
+    log("PHASE", "PLANNING")
+    state = run_planning(task, tools, client, max_planning_steps)
+    if state.clarification_needed:
+        final = f"Clarification required before execution: {state.clarification_needed}"
+        log("AGENT STOPPED", final)
+        return final
+    log("PHASE", "EXECUTION")
+    return run_execution(state, tools, client, max_steps)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal coding agent baseline")
     parser.add_argument("task", nargs="?", help="Programming task. If omitted, read interactively.")
     parser.add_argument("--workspace", default=".", help="Workspace directory (default: current directory)")
     parser.add_argument("--max-steps", type=int, default=12, help="Maximum model turns (default: 12)")
+    parser.add_argument("--max-planning-steps", type=int, default=8, help="Maximum planning turns (default: 8)")
     return parser.parse_args()
 
 
@@ -305,11 +593,14 @@ def main() -> int:
     if args.max_steps < 1:
         print("--max-steps must be at least 1.", file=sys.stderr)
         return 2
+    if args.max_planning_steps < 1:
+        print("--max-planning-steps must be at least 1.", file=sys.stderr)
+        return 2
     try:
         workspace = Path(args.workspace).resolve(strict=True)
         if not workspace.is_dir():
             raise ValueError("workspace is not a directory")
-        run_agent(task, workspace, args.max_steps)
+        run_agent(task, workspace, args.max_steps, args.max_planning_steps)
         return 0
     except (RuntimeError, ValueError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
