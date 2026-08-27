@@ -3,7 +3,9 @@
 这是一个刻意保持简单的 Coding Agent。它不使用 LangChain、OpenAI Agents SDK、
 AutoGen 等 Agent 框架或 SDK；Agent 循环、消息历史、工具定义与执行、结果回传、
 终止条件和错误处理均自行实现。状态数据与上下文选择分别拆分在
-`agent_state.py` 和 `context_manager.py`，入口循环仍位于 `coding_agent.py`。
+`agent_state.py` 和 `context_manager.py`；工具注册、安全策略与执行分别拆分在
+`tool_registry.py`、`tool_safety.py` 和 `tool_executor.py`，入口循环仍位于
+`coding_agent.py`。
 
 ## 运行环境
 
@@ -33,7 +35,8 @@ python coding_agent.py --workspace demo_project "阅读项目，定位并修复�
 2. 模型通过 `submit_plan` 生成结构化验收标准、验证契约和执行计划；
 3. 程序在修改前执行契约中标记的 baseline 检查并保存结果；
 4. 完整打印规划状态，然后进入原有执行循环；
-5. 模型使用全部工具实施计划，直到给出结论或达到最大步数。
+5. 模型使用当前 phase 允许的工具实施计划；调用 `finish` 后只进入 `VERIFYING`，
+   不会直接把任务标记为完成。
 
 程序会逐步打印模型消息、工具名、参数、执行结果和终止原因。每次调用模型前还会打印
 `[Context]`，列出当前 phase、实际包含的 section 和总字符数。
@@ -66,18 +69,31 @@ python coding_agent.py --workspace demo_project "阅读项目，定位并修复�
 DEBUGGING 上下文时，ContextManager 会从 workspace 重新读取文件并按符号截取附近代码，
 因此磁盘上的当前文件始终是代码内容的唯一真实来源。
 
-## 本地工具
+## 工具执行与安全边界
 
-- `list_files`：列出 workspace 中的文件和目录；
-- `read_file`：读取 UTF-8 文本文件；
-- `write_file`：创建或完整覆写 UTF-8 文本文件，也用于修改；
-- `search_text`：递归搜索文本并返回文件、行号和内容；
-- `run_command`：通过 `subprocess.run` 在 workspace 中执行参数数组，采用
-  `shell=False`，返回 stdout、stderr、exit code，并限制超时时间为 1–120 秒。
+核心工具为 `read_file`、`list_dir`、`search_code`、`apply_patch`、`run_command`
+和 `finish`。`write_file` 仅为旧调用兼容保留，新修改优先使用严格单次文本替换的
+`apply_patch`。工具按副作用分为：
 
-所有直接文件工具都会解析规范路径并检查其仍位于 workspace 内。命令固定以
-workspace 为工作目录，且不经过 shell。需要注意：普通操作系统进程本身并不是强安全
-沙箱；若要对恶意命令提供不可绕过的隔离，应在容器或受限系统账户中运行本程序。
+- `READ_ONLY`：`read_file`、`list_dir`、`search_code`；
+- `MUTATING`：`apply_patch`、兼容的 `write_file`；
+- `EXECUTION`：`run_command`；
+- `CONTROL`：`finish`。
+
+`tool_registry.py` 集中维护 phase 权限。PLANNING 禁止修改文件，只允许读取工具和有限
+测试/只读查询命令；EXECUTING 与 DEBUGGING 可修改、执行并请求 `finish`；VERIFYING
+只允许读取、搜索和运行验证命令。未授权调用返回包含当前可用替代工具的 `BLOCKED`
+结果，不会导致 Agent 崩溃。
+
+`CommandPolicy` 使用离散的 `SAFE / CONFIRM / DENY`：常见测试、编译和只读 Git 命令
+直接执行；删除、覆盖、安装依赖、未知或复杂命令需要同步确认；系统级危险命令和明显
+workspace 路径逃逸直接拒绝，不能通过确认绕过。命令始终使用 workspace 作为 `cwd`、
+`shell=False`、捕获标准输出与错误并限制为 1–120 秒。超过
+`MAX_COMMAND_OUTPUT_CHARS` 时同时保留头尾，在中间标记省略的字符和行数。
+
+`WorkspaceGuard` 集中处理文件路径，resolve 后必须仍位于 workspace 内。该实现只是
+workspace-scoped best-effort policy，不是真正的 OS sandbox；面对不可信命令仍应使用
+容器或受限系统账户。
 
 ## Demo
 
@@ -98,10 +114,12 @@ python -m unittest -v
 ```powershell
 python -m unittest -v test_planning.py
 python -m unittest -v test_context_manager.py
+python -m unittest -v test_tool_safety.py
 ```
 
 离线观察四个 phase 的上下文组成（不调用模型 API，也不修改 demo 文件）：
 
 ```powershell
 python demo_context.py
+python demo_tool_safety.py
 ```
