@@ -75,12 +75,25 @@ TOOLS = {
     "apply_patch": ToolDefinition(
         "apply_patch",
         MUTATING,
-        "Replace one exact text occurrence in a workspace file. No fuzzy matching or verification is performed.",
-        _object({
-            "path": {"type": "string"},
-            "old_text": {"type": "string"},
-            "new_text": {"type": "string"},
-        }, ["path", "old_text", "new_text"]),
+        "Apply one local structured edit, or select a candidate from the most recent ambiguous edit.",
+        {
+            "type": "object",
+            "properties": {
+                "file": {"type": "string"},
+                "operation": {"type": "string", "enum": ["replace", "insert", "delete"]},
+                "intent": {"type": "string"},
+                "symbol": {"type": "string"},
+                "anchor": {"type": "string"},
+                "old_block": {"type": "string"},
+                "new_block": {"type": "string"},
+                "candidate_id": {"type": "string"},
+            },
+            "anyOf": [
+                {"required": ["file", "operation", "intent"]},
+                {"required": ["candidate_id"]},
+            ],
+            "additionalProperties": False,
+        },
     ),
     "run_command": ToolDefinition(
         "run_command",
@@ -114,9 +127,9 @@ TOOLS = {
 
 PHASE_PERMISSIONS = {
     PLANNING: {"read_file", "list_dir", "search_code", "run_command"},
-    EXECUTING: {"read_file", "list_dir", "search_code", "apply_patch", "write_file", "run_command", "finish"},
+    EXECUTING: {"read_file", "list_dir", "search_code", "apply_patch", "run_command", "finish"},
     VERIFYING: {"read_file", "search_code", "run_command"},
-    DEBUGGING: {"read_file", "list_dir", "search_code", "apply_patch", "write_file", "run_command", "finish"},
+    DEBUGGING: {"read_file", "list_dir", "search_code", "apply_patch", "run_command", "finish"},
 }
 
 

@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_state import PLANNING, VERIFYING, AgentState
+from edit_models import APPLIED, BLOCKED, FAILED, INVALID_EDIT, STALE_EDIT, ChangeSet, StructuredEditRequest
+from edit_resolver import EditResolver
 from tool_registry import TOOLS, permission_result
 from tool_safety import CONFIRM, DENY, CommandPolicy, WorkspaceGuard
 
@@ -40,6 +42,8 @@ class ToolExecutor:
         self.root = self.guard.root
         self.command_policy = CommandPolicy(self.guard)
         self.confirm_callback = confirm_callback or self._confirm_with_input
+        self.edit_resolver = EditResolver()
+        self._change_counter = 0
 
     def call(self, state: AgentState, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         request_phase = state.current_phase
@@ -55,7 +59,7 @@ class ToolExecutor:
             elif name == "search_code":
                 result = self.search_code(**arguments)
             elif name == "apply_patch":
-                result = self.apply_patch(**arguments)
+                result = self.apply_patch(state, **arguments)
             elif name == "write_file":
                 result = self.write_file(**arguments)
             elif name == "run_command":
@@ -146,24 +150,111 @@ class ToolExecutor:
                     return self._search_result(matches, True)
         return self._search_result(matches, False)
 
-    def apply_patch(self, path: str, old_text: str, new_text: str) -> dict[str, Any]:
-        if not old_text:
-            raise ValueError("old_text cannot be empty")
-        target = self.guard.resolve(path)
+    def apply_patch(
+        self,
+        state: AgentState,
+        file: str | None = None,
+        operation: str | None = None,
+        intent: str | None = None,
+        symbol: str | None = None,
+        anchor: str | None = None,
+        old_block: str | None = None,
+        new_block: str | None = None,
+        candidate_id: str | None = None,
+    ) -> dict[str, Any]:
+        if candidate_id:
+            pending = self.edit_resolver.pending_request
+            if not pending:
+                result = {"status": INVALID_EDIT, "candidate_id": candidate_id, "reason": "no ambiguous edit is pending"}
+                self._log_edit(result)
+                return result
+            request = pending
+            file = pending.file
+        else:
+            if not file or not operation or not intent:
+                result = {
+                    "status": INVALID_EDIT,
+                    "file": file,
+                    "reason": "file, operation, and intent are required unless candidate_id is provided",
+                }
+                self._log_edit(result)
+                return result
+            request = StructuredEditRequest(file, operation, intent, symbol, anchor, old_block, new_block)
+
+        try:
+            target = self.guard.resolve(file or "")
+        except ValueError as exc:
+            result = {"status": BLOCKED, "file": file, "reason": str(exc)}
+            self._log_edit(result)
+            return result
         if not target.is_file():
-            raise ValueError(f"not a file: {path}")
-        content = target.read_text(encoding="utf-8")
-        occurrences = content.count(old_text)
-        if occurrences != 1:
-            raise ValueError(f"old_text must match exactly once; found {occurrences}")
-        target.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
-        return {
-            "status": "SUCCESS",
+            result = {"status": FAILED, "file": file, "reason": f"not a file: {file}"}
+            self._log_edit(result)
+            return result
+        try:
+            source = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            result = {"status": FAILED, "file": file, "reason": f"{type(exc).__name__}: {exc}"}
+            self._log_edit(result)
+            return result
+
+        resolved = (
+            self.edit_resolver.resolve_candidate(candidate_id, source)
+            if candidate_id
+            else self.edit_resolver.resolve(request, source, target)
+        )
+        if isinstance(resolved, dict):
+            self._log_edit(resolved, request)
+            return resolved
+
+        try:
+            latest = target.read_text(encoding="utf-8")
+            source_changed = resolved.operation == "insert" and latest != source
+            target_changed = latest[resolved.start:resolved.end] != resolved.before
+            if source_changed or target_changed:
+                result = {
+                    "status": STALE_EDIT,
+                    "file": resolved.file,
+                    "symbol": resolved.symbol,
+                    "reason": "target changed between resolution and apply",
+                    "current_context": latest[max(0, resolved.start - 500):resolved.end + 500],
+                }
+                self._log_edit(result, request)
+                return result
+            updated = latest[:resolved.start] + resolved.after + latest[resolved.end:]
+            target.write_text(updated, encoding="utf-8")
+        except OSError as exc:
+            result = {"status": FAILED, "file": resolved.file, "reason": f"{type(exc).__name__}: {exc}"}
+            self._log_edit(result, request)
+            return result
+
+        self._change_counter += 1
+        change = ChangeSet(
+            id=f"change_{self._change_counter:04d}",
+            file=target.relative_to(self.root).as_posix(),
+            symbol=resolved.symbol,
+            operation=resolved.operation,
+            intent=resolved.intent,
+            before=resolved.before,
+            after=resolved.after,
+            status=APPLIED,
+            step_id=state.current_step,
+            phase=state.current_phase,
+        )
+        state.change_sets.append(change.to_dict())
+        result = {
+            "status": APPLIED,
             "tool": "apply_patch",
             "category": TOOLS["apply_patch"].category,
-            "path": target.relative_to(self.root).as_posix(),
-            "replacements": 1,
+            "file": change.file,
+            "symbol": resolved.symbol,
+            "operation": resolved.operation,
+            "intent": resolved.intent,
+            "resolution": resolved.resolution,
+            "change_set": change.to_dict(),
         }
+        self._log_edit(result, request)
+        return result
 
     def write_file(self, path: str, content: str) -> dict[str, Any]:
         target = self.guard.resolve(path)
@@ -275,4 +366,25 @@ class ToolExecutor:
         if result.get("exit_code") is not None:
             print(f"Exit code: {result['exit_code']}", flush=True)
         if result.get("reason") and result.get("status") != "SUCCESS":
+            print(f"Reason: {result['reason']}", flush=True)
+
+    @staticmethod
+    def _log_edit(result: dict[str, Any], request: StructuredEditRequest | None = None) -> None:
+        print("\n[Edit]", flush=True)
+        print(f"File: {result.get('file') or (request.file if request else '')}", flush=True)
+        operation = result.get("operation") or (request.operation if request else None)
+        intent = result.get("intent") or (request.intent if request else None)
+        symbol = result.get("symbol") or (request.symbol if request else None)
+        if operation:
+            print(f"Operation: {operation}", flush=True)
+        if intent:
+            print(f"Intent: {intent}", flush=True)
+        if result.get("resolution"):
+            print(f"Resolution: {result['resolution']}", flush=True)
+        if symbol:
+            print(f"Symbol: {symbol}", flush=True)
+        print(f"Status: {result.get('status', 'UNKNOWN')}", flush=True)
+        if result.get("candidate_count") is not None:
+            print(f"Candidates: {result['candidate_count']}", flush=True)
+        if result.get("reason"):
             print(f"Reason: {result['reason']}", flush=True)

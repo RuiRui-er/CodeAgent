@@ -34,6 +34,7 @@ PHASE_SECTION_BUDGETS = {
         "Verification Contract": 4000,
         "Baseline": 3000,
         "Modification Summary": 2200,
+        "Change Sets": 3200,
         "Completed Steps": 2200,
         "Latest Results": 4500,
     },
@@ -111,6 +112,7 @@ class ContextManager:
                 ("Verification Contract", [asdict(item) for item in state.verification_contract]),
                 ("Baseline", state.baseline),
                 ("Modification Summary", state.confirmed_facts),
+                ("Change Sets", state.change_sets),
                 ("Completed Steps", state.completed_steps),
                 ("Latest Results", state.recent_actions[-RECENT_ACTION_LIMIT:]),
             ]

@@ -245,10 +245,35 @@ def _shorten(text: str, limit: int = 1200) -> str:
 
 def _compact_observation(name: str, result: dict[str, Any]) -> dict[str, Any]:
     status = result.get("status", "UNKNOWN")
-    if status != "SUCCESS":
+    if status == "AMBIGUOUS_TARGET":
+        return {
+            "status": status,
+            "file": result.get("file"),
+            "candidate_count": result.get("candidate_count"),
+            "candidates": result.get("candidates", []),
+            "reason": result.get("reason"),
+        }
+    if status == "STALE_EDIT":
+        return {
+            "status": status,
+            "file": result.get("file"),
+            "reason": result.get("reason"),
+            "current_context": _shorten(result.get("current_context", "")),
+        }
+    if status not in {"SUCCESS", "APPLIED"}:
         return {
             "status": status,
             "reason": _shorten(str(result.get("reason", result.get("stderr", "unknown error")))),
+        }
+    if name == "apply_patch":
+        change = result.get("change_set", {})
+        return {
+            "status": status,
+            "file": result.get("file"),
+            "symbol": result.get("symbol"),
+            "operation": result.get("operation"),
+            "resolution": result.get("resolution"),
+            "change_set_id": change.get("id"),
         }
     if name == "read_file":
         content = result.get("content", "")
@@ -285,7 +310,7 @@ def _record_tool_event(
         "observation": _compact_observation(name, result),
     })
 
-    succeeded = result.get("status") == "SUCCESS"
+    succeeded = result.get("status") in {"SUCCESS", "APPLIED"}
     if name == "read_file" and succeeded:
         state.add_relevant_file(str(arguments.get("path", "")))
     elif name == "search_code" and succeeded:
@@ -293,13 +318,15 @@ def _record_tool_event(
         for match in result.get("matches", []):
             state.add_relevant_file(str(match.get("path", "")))
     elif name in {"apply_patch", "write_file"} and succeeded:
-        path = str(result.get("path", arguments.get("path", "")))
+        path = str(result.get("file", result.get("path", arguments.get("file", arguments.get("path", "")))))
         state.add_relevant_file(path)
+        if result.get("symbol"):
+            state.add_relevant_symbol(str(result["symbol"]))
         state.add_fact(f"A {name} mutation succeeded for {path}.")
     elif name == "finish" and succeeded:
         state.complete_current_step()
 
-    failure_statuses = {"FAILED", "TIMEOUT"}
+    failure_statuses = {"FAILED", "TIMEOUT", "TARGET_NOT_FOUND", "STALE_EDIT", "INVALID_EDIT"}
     if allow_phase_changes and result.get("status") in failure_statuses:
         reason = _shorten(str(result.get("reason", result.get("stderr", "unknown tool error"))))
         state.failed_attempts.append({"attempt": f"{name} {arguments}", "reason": reason})

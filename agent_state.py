@@ -61,6 +61,7 @@ class AgentState:
     recent_actions: list[dict[str, Any]] = field(default_factory=list)
     relevant_files: list[str] = field(default_factory=list)
     relevant_symbols: list[str] = field(default_factory=list)
+    change_sets: list[dict[str, Any]] = field(default_factory=list)
 
     def planning_snapshot(self) -> dict[str, Any]:
         return asdict(self)

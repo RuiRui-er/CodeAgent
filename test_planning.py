@@ -50,7 +50,7 @@ class FakePlanningClient:
                             "execution_plan": [{
                                 "step_id": "STEP-1",
                                 "description": "Correct the operand order, then run V-1.",
-                                "suggested_tools": ["read_file", "write_file", "run_command"],
+                                "suggested_tools": ["read_file", "apply_patch", "run_command"],
                                 "related_acceptance_criteria": ["AC-1"],
                             }],
                             "clarification_needed": None,

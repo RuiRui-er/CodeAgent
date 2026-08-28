@@ -27,7 +27,7 @@ def main() -> None:
     ]
     state.execution_plan = [
         ExecutionStep("STEP-1", "Inspect divide", ["read_file"], ["AC-1"]),
-        ExecutionStep("STEP-2", "Fix and test divide", ["write_file", "run_command"], ["AC-1"]),
+        ExecutionStep("STEP-2", "Fix and test divide", ["apply_patch", "run_command"], ["AC-1"]),
     ]
     state.current_step = "STEP-1"
 
