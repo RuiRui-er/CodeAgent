@@ -5,3 +5,4 @@ venv/
 .venv/
 .test_workspaces/
 .demo_checkpoint_runtime/
+.demo_verification_runtime/

@@ -194,4 +194,48 @@ python demo_context.py
 python demo_tool_safety.py
 python demo_structured_edit.py
 python demo_checkpoint_recovery.py
+python demo_evidence_gated_verification.py
+```
+
+## Evidence-Gated Verification
+
+`finish` 现在只表示申请结束。`VerificationEngine` 会读取 PLANNING 阶段已经冻结的
+Acceptance Criteria、Verification Contract 和 baseline，重新执行最终 AUTO checks；
+它不会修改 criterion、expected output、command 或 baseline，也不会把模型代码审查当成
+正式证据。
+
+验证结果分为两层：单条 `CriterionResult` 使用 `PASS / FAIL / UNVERIFIED /
+NOT_APPLICABLE`，记录 criterion ID、证据类型、证据来源、冻结命令、退出码、摘要、细节
+和 verification check IDs；整体 `VerificationResult` 使用 `VERIFIED /
+PARTIALLY_VERIFIED / REGRESSED / UNVERIFIED`，同时保留 Target、Regression、Sanity、
+baseline failures、current failures、new failures、Critical 分类和人工确认项。
+
+命令按固定的 Cheap Evidence First 顺序运行：SANITY → TARGET → REGRESSION。Sanity
+失败时停止后续昂贵 checks。Target 证明目标行为；Sanity 只证明基本工程完整性；
+Regression 必须与同一 verification ID 的 baseline 比较。若测试输出能识别测试名，则比较
+失败项集合；修改前已经失败且修改后保持相同的测试不会成为新 regression。无法提取名称
+时，只有 baseline PASS 变成当前 FAIL 才明确算作新增 regression。
+
+整体状态采用离散规则：
+
+- `VERIFIED`：所有 Critical 都有环境证据且 PASS、必要 Sanity PASS、无新增 regression，
+  也没有失败的自动 Non-critical criterion。
+- `PARTIALLY_VERIFIED`：满足 VERIFIED 的核心条件，仅剩 Non-critical HUMAN 项。
+- `REGRESSED`：发现 baseline 原本通过的项目失败，或逐项比较出现新增失败；优先级最高。
+- `UNVERIFIED`：Critical 缺少独立证据、Critical/必要 Sanity 失败，或其他证据不足。
+
+VERIFIED 和 PARTIALLY_VERIFIED 会更新 pending ChangeSet 并请求 stable checkpoint，最终
+finish 才能进入 DONE。REGRESSED 会先尝试最近 ChangeSet Undo，无法安全撤销时才回退到
+stable checkpoint，并进入 DEBUGGING。Target FAIL 但没有新增 regression 时保留修改进入
+DEBUGGING，不自动回滚。Critical 缺少自动证据时保持非 DONE 并报告人工确认需求。
+
+`failed_finish_attempts` 记录失败的结束申请。达到固定 guardrail 后，DEBUGGING context
+重新包含完整冻结 criteria、失败 CriterionResult 和证据，重复 finish 不能改变验收规则。
+只有 VerificationEngine 解释为 Criterion PASS 的环境结果才能写入 `confirmed_facts`。
+
+离线测试与隔离 Git demo：
+
+```powershell
+python -m unittest -v test_verification_engine.py
+python demo_evidence_gated_verification.py
 ```
