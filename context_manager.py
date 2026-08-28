@@ -35,6 +35,7 @@ PHASE_SECTION_BUDGETS = {
         "Baseline": 3000,
         "Modification Summary": 2200,
         "Change Sets": 3200,
+        "Current Checkpoint": 1800,
         "Completed Steps": 2200,
         "Latest Results": 4500,
     },
@@ -113,6 +114,7 @@ class ContextManager:
                 ("Baseline", state.baseline),
                 ("Modification Summary", state.confirmed_facts),
                 ("Change Sets", state.change_sets),
+                ("Current Checkpoint", state.current_checkpoint),
                 ("Completed Steps", state.completed_steps),
                 ("Latest Results", state.recent_actions[-RECENT_ACTION_LIMIT:]),
             ]

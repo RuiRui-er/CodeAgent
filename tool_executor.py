@@ -7,7 +7,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_state import PLANNING, VERIFYING, AgentState
-from edit_models import APPLIED, BLOCKED, FAILED, INVALID_EDIT, STALE_EDIT, ChangeSet, StructuredEditRequest
+from checkpoint_manager import CheckpointManager
+from edit_models import (
+    APPLIED,
+    BLOCKED,
+    FAILED,
+    INVALID_EDIT,
+    ROLLBACK_NONE,
+    STALE_EDIT,
+    UNVERIFIED,
+    ChangeSet,
+    StructuredEditRequest,
+)
 from edit_resolver import EditResolver
 from tool_registry import TOOLS, permission_result
 from tool_safety import CONFIRM, DENY, CommandPolicy, WorkspaceGuard
@@ -44,6 +55,8 @@ class ToolExecutor:
         self.confirm_callback = confirm_callback or self._confirm_with_input
         self.edit_resolver = EditResolver()
         self._change_counter = 0
+        self.checkpoint_manager = CheckpointManager(self.root)
+        self.checkpoint_manager.initialize()
 
     def call(self, state: AgentState, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         request_phase = state.current_phase
@@ -229,6 +242,7 @@ class ToolExecutor:
             return result
 
         self._change_counter += 1
+        checkpoint = self.checkpoint_manager.get_current_checkpoint()
         change = ChangeSet(
             id=f"change_{self._change_counter:04d}",
             file=target.relative_to(self.root).as_posix(),
@@ -237,11 +251,20 @@ class ToolExecutor:
             intent=resolved.intent,
             before=resolved.before,
             after=resolved.after,
-            status=APPLIED,
+            apply_status=APPLIED,
+            verification_status=UNVERIFIED,
+            rollback_status=ROLLBACK_NONE,
             step_id=state.current_step,
             phase=state.current_phase,
+            checkpoint_base=checkpoint["id"] if checkpoint else None,
+            start=resolved.start,
+            context_before=latest[max(0, resolved.start - 120):resolved.start],
+            context_after=latest[resolved.end:resolved.end + 120],
         )
-        state.change_sets.append(change.to_dict())
+        change_data = change.to_dict()
+        state.change_sets.append(change_data)
+        state.current_checkpoint = checkpoint
+        self.checkpoint_manager.register_change(change_data)
         result = {
             "status": APPLIED,
             "tool": "apply_patch",
@@ -251,7 +274,7 @@ class ToolExecutor:
             "operation": resolved.operation,
             "intent": resolved.intent,
             "resolution": resolved.resolution,
-            "change_set": change.to_dict(),
+            "change_set": change_data,
         }
         self._log_edit(result, request)
         return result

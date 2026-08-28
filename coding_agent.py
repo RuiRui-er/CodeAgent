@@ -350,6 +350,7 @@ def run_planning(
     max_planning_steps: int,
 ) -> AgentState:
     state = AgentState(original_task=task)
+    state.current_checkpoint = tools.checkpoint_manager.get_current_checkpoint()
     context_manager = ContextManager(tools.root)
     trajectory: list[dict[str, Any]] = []
     planning_tools = tool_schemas_for_phase(PLANNING) + [SUBMIT_PLAN_SCHEMA]
