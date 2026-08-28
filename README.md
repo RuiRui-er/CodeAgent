@@ -96,8 +96,46 @@ anchor 仍存在但 `old_block` 已消失，则返回 `STALE_EDIT` 和当前局�
 所有定位都是离散规则，不使用 fuzzy score。
 
 成功写回后记录轻量 ChangeSet：ID、文件、symbol、operation、intent、before、after、
-当前 step、phase 和 `APPLIED` 状态。ChangeSet 只描述发生的修改，不代表 VERIFIED，
-也不会触发测试、编译、Git commit、snapshot 或 rollback。
+当前 step、phase 和 checkpoint base。状态拆分为 `apply_status`、
+`verification_status`、`rollback_status`；新 ChangeSet 固定从
+`APPLIED / UNVERIFIED / NONE` 开始，不会因为写入成功就自动 VERIFIED。
+
+## ChangeSet Recovery 与 Stable Checkpoint
+
+`CheckpointManager` 维护两条语义分离的历史：ChangeSet 记录 Agent 做过的局部修改，
+Stable Checkpoint 只记录已经由上层验证接口确认值得保存的 Git 版本。一次
+`apply_patch` 只注册 pending ChangeSet，不创建 Git commit。
+
+局部 `undo_changeset` 只处理仍 pending 的 ChangeSet。它拒绝撤销已进入 checkpoint 的
+修改，也拒绝撤销已被后续同文件 ChangeSet 覆盖的修改。恢复前会再次核对保存的 offset、
+after 内容及前后局部上下文；任何不一致都返回 `UNSAFE_TO_UNDO`，不会猜测。Undo 保留
+原有 verification 结论，只把 `rollback_status` 更新为 `UNDONE`。
+
+如果 target workspace 自身是 clean Git repo，启动时直接把当前 HEAD 登记为
+`checkpoint_000`，不会创建额外 commit。如果 workspace 非 Git repo、只是嵌套在其他
+仓库下，或 working tree 已有用户修改，checkpoint 功能不可用；不会自动 git init、
+stash、commit 或 reset，但 ChangeSet Undo 仍可使用。
+
+上层通过 `update_change_verification` 写入 `VERIFIED`、`PARTIALLY_VERIFIED` 或
+`REGRESSED`。只有 pending ChangeSets 均具有可接受的验证状态时，显式调用
+`mark_stable(reason, verification_ref)` 才会仅 stage Agent 已知文件并创建固定格式的
+checkpoint commit。CheckpointManager 不运行测试，也不自行判断验证结果。
+
+`rollback_last_stable` 会先比较当前 HEAD，并使用 pending ChangeSet 文件集合与
+`git status --porcelain --untracked-files=all` 检测未知修改。存在用户手动产生的未知文件
+或修改时返回 `UNEXPECTED_WORKSPACE_CHANGE`，禁止 reset。安全回滚后 pending
+ChangeSets 标记为 `CHECKPOINT_ROLLED_BACK`，phase 切到 DEBUGGING，并记录恢复原因。
+
+Checkpoint demo 始终在被忽略的独立嵌套仓库中运行，避免污染 CodeAgent 自身历史：
+
+```text
+CodeAgent/
+    agent source...
+    .demo_checkpoint_runtime/
+        target_repo/
+            .git/
+            app.py
+```
 
 ## 工具执行与安全边界
 
@@ -146,6 +184,7 @@ python -m unittest -v test_planning.py
 python -m unittest -v test_context_manager.py
 python -m unittest -v test_tool_safety.py
 python -m unittest -v test_edit_resolver.py
+python -m unittest -v test_checkpoint_manager.py
 ```
 
 离线观察四个 phase 的上下文组成（不调用模型 API，也不修改 demo 文件）：
@@ -154,4 +193,5 @@ python -m unittest -v test_edit_resolver.py
 python demo_context.py
 python demo_tool_safety.py
 python demo_structured_edit.py
+python demo_checkpoint_recovery.py
 ```
