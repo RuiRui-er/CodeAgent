@@ -10,7 +10,8 @@ PLANNING = "PLANNING"
 EXECUTING = "EXECUTING"
 VERIFYING = "VERIFYING"
 DEBUGGING = "DEBUGGING"
-PHASES = {PLANNING, EXECUTING, VERIFYING, DEBUGGING}
+DONE = "DONE"
+PHASES = {PLANNING, EXECUTING, VERIFYING, DEBUGGING, DONE}
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,11 @@ class AgentState:
     relevant_symbols: list[str] = field(default_factory=list)
     change_sets: list[dict[str, Any]] = field(default_factory=list)
     current_checkpoint: dict[str, Any] | None = None
+    verification_result: dict[str, Any] | None = None
+    manual_confirmation_items: list[str] = field(default_factory=list)
+    failed_finish_attempts: int = 0
+    finish_guardrail_active: bool = False
+    verification_sequence: int = 0
 
     def planning_snapshot(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,3 +105,7 @@ class AgentState:
         except ValueError:
             return
         self.current_step = ids[index + 1] if index + 1 < len(ids) else None
+
+    def next_verification_ref(self) -> str:
+        self.verification_sequence += 1
+        return f"verification_{self.verification_sequence:03d}"
