@@ -25,6 +25,7 @@ from agent_state import (
 from context_manager import ContextManager
 from tool_executor import ToolExecutor
 from tool_registry import tool_schemas_for_phase
+from verification_engine import VerificationEngine
 
 # Import compatibility for callers of the earlier single-file implementation.
 WorkspaceTools = ToolExecutor
@@ -54,8 +55,9 @@ mark checks that should be run now as baseline_required. Prefer existing tests, 
 minimal reproduction or input/output check, then build/compile and runtime sanity.
 If a missing target check needs a new file, put creation and its pre-fix run before
 product-code changes in the execution plan. Tie every plan step to criterion IDs.
-Do not propose structured patches, snapshots, Git checkpoints, advanced verification
-statuses, multiple agents, RAG, or UI.
+Freeze target cases, expected behavior, and commands now; they must not be regenerated
+after implementation. Prefer cheap sanity evidence before target and regression checks.
+Do not propose multiple agents, RAG, or UI.
 """
 
 
@@ -322,7 +324,6 @@ def _record_tool_event(
         state.add_relevant_file(path)
         if result.get("symbol"):
             state.add_relevant_symbol(str(result["symbol"]))
-        state.add_fact(f"A {name} mutation succeeded for {path}.")
     elif name == "finish" and succeeded:
         state.complete_current_step()
 
@@ -408,6 +409,7 @@ files as the only source of truth for current code.
 """
     state.set_phase(EXECUTING)
     context_manager = ContextManager(tools.root)
+    verification_engine = VerificationEngine(tools)
     trajectory: list[dict[str, Any]] = []
 
     for step in range(1, max_steps + 1):
@@ -441,10 +443,45 @@ files as the only source of truth for current code.
                 result = tools.call(state, name, arguments)
             log("TOOL RESULT", result)
             _record_tool_event(state, name, arguments, result, trajectory, allow_phase_changes=True)
+            if name == "finish" and result.get("status") == "SUCCESS":
+                verification = verification_engine.run_final_verification(state)
+                log("FINAL VERIFICATION", verification)
+                overall = verification["overall_status"]
+                if overall in {"VERIFIED", "PARTIALLY_VERIFIED"}:
+                    final = _verification_report(verification)
+                    log("AGENT DONE", final)
+                    return final
+                if (
+                    overall == "UNVERIFIED"
+                    and verification.get("unverified_critical")
+                    and state.current_phase == VERIFYING
+                ):
+                    final = _verification_report(verification)
+                    log("HUMAN CONFIRMATION REQUIRED", final)
+                    return final
+                # A failed finish starts a fresh DEBUGGING decision; ignore any
+                # additional tool calls bundled with the finish request.
+                break
 
     final = f"Stopped after reaching the maximum of {max_steps} steps."
     log("AGENT STOPPED", final)
     return final
+
+
+def _verification_report(result: dict[str, Any]) -> str:
+    lines = [f"Verification: {result['overall_status']}", result["evidence_summary"]]
+    if result.get("manual_items"):
+        lines.append("Manual confirmation: " + ", ".join(result["manual_items"]))
+    if result.get("failed_critical"):
+        lines.append("Failed critical criteria: " + ", ".join(result["failed_critical"]))
+    if result.get("unverified_critical"):
+        lines.append("Critical criteria without environment evidence: " + ", ".join(result["unverified_critical"]))
+    if result.get("new_failures"):
+        lines.append("New regressions: " + ", ".join(result["new_failures"]))
+    checkpoint = result.get("checkpoint_result") or {}
+    if checkpoint.get("status"):
+        lines.append(f"Checkpoint: {checkpoint['status']}")
+    return "\n".join(lines)
 
 
 def run_agent(task: str, workspace: Path, max_steps: int, max_planning_steps: int = 8) -> str:

@@ -36,6 +36,10 @@ PHASE_SECTION_BUDGETS = {
         "Modification Summary": 2200,
         "Change Sets": 3200,
         "Current Checkpoint": 1800,
+        "Criterion Results": 4200,
+        "New Regressions": 2200,
+        "Verification Summary": 2200,
+        "Manual Confirmation": 1800,
         "Completed Steps": 2200,
         "Latest Results": 4500,
     },
@@ -44,6 +48,9 @@ PHASE_SECTION_BUDGETS = {
         "Current Step": 2200,
         "Failure Evidence": 4000,
         "Failed Attempts": 3000,
+        "Failed Criteria": 3200,
+        "Recovery Result": 2200,
+        "Finish Guardrail": 2600,
         "Relevant Code": 5500,
         "Recent Actions": 2200,
     },
@@ -115,6 +122,10 @@ class ContextManager:
                 ("Modification Summary", state.confirmed_facts),
                 ("Change Sets", state.change_sets),
                 ("Current Checkpoint", state.current_checkpoint),
+                ("Criterion Results", (state.verification_result or {}).get("criterion_results")),
+                ("New Regressions", (state.verification_result or {}).get("new_failures")),
+                ("Verification Summary", (state.verification_result or {}).get("evidence_summary")),
+                ("Manual Confirmation", state.manual_confirmation_items),
                 ("Completed Steps", state.completed_steps),
                 ("Latest Results", state.recent_actions[-RECENT_ACTION_LIMIT:]),
             ]
@@ -123,9 +134,27 @@ class ContextManager:
             ("Current Step", self._current_step(state)),
             ("Failure Evidence", state.failure_evidence),
             ("Failed Attempts", state.failed_attempts),
+            ("Failed Criteria", self._failed_criteria(state)),
+            ("Recovery Result", (state.verification_result or {}).get("recovery_result")),
+            ("Finish Guardrail", self._finish_guardrail(state)),
             ("Relevant Code", self._read_relevant_code(state)),
             ("Recent Actions", state.recent_actions[-RECENT_ACTION_LIMIT:]),
         ]
+
+    @staticmethod
+    def _failed_criteria(state: AgentState) -> list[dict[str, Any]]:
+        result = state.verification_result or {}
+        return [item for item in result.get("criterion_results", []) if item.get("status") != "PASS"]
+
+    @staticmethod
+    def _finish_guardrail(state: AgentState) -> dict[str, Any] | None:
+        if not state.finish_guardrail_active:
+            return None
+        return {
+            "failed_finish_attempts": state.failed_finish_attempts,
+            "acceptance_criteria": [asdict(item) for item in state.acceptance_criteria],
+            "instruction": "Continue debugging against the frozen criteria and evidence; finish cannot bypass the gate.",
+        }
 
     def _current_step(self, state: AgentState) -> dict[str, Any] | None:
         return next(
