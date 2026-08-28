@@ -69,11 +69,41 @@ python coding_agent.py --workspace demo_project "阅读项目，定位并修复�
 DEBUGGING 上下文时，ContextManager 会从 workspace 重新读取文件并按符号截取附近代码，
 因此磁盘上的当前文件始终是代码内容的唯一真实来源。
 
+## Confidence-aware Structured Editing
+
+`apply_patch` 不再接收整文件内容或 unified diff，而是接收单个局部修改意图：
+
+```json
+{
+  "file": "src/parser.py",
+  "operation": "replace",
+  "intent": "Handle empty input",
+  "symbol": "Parser.parse",
+  "anchor": "def parse(self, value):",
+  "old_block": "return None",
+  "new_block": "return ''"
+}
+```
+
+`operation` 支持 `replace`、`insert`、`delete`。replace/delete 必须包含 `old_block`，
+replace/insert 必须包含 `new_block`；保守起见，第一版 insert 还要求稳定的 `anchor`。
+一次请求只能修改一个文件中的一个局部位置，且受可配置的 `MAX_EDIT_LINES` 限制。
+
+`EditResolver` 每次从磁盘当前内容开始，依次尝试 Python AST symbol scope、anchor 附近
+local context、whole-file unique content，只有唯一定位才应用。如果存在多个精确匹配，
+返回带 symbol、行范围和上下文的候选列表；下一次可仅传 `candidate_id`。如果 symbol 或
+anchor 仍存在但 `old_block` 已消失，则返回 `STALE_EDIT` 和当前局部代码，不猜测新位置。
+所有定位都是离散规则，不使用 fuzzy score。
+
+成功写回后记录轻量 ChangeSet：ID、文件、symbol、operation、intent、before、after、
+当前 step、phase 和 `APPLIED` 状态。ChangeSet 只描述发生的修改，不代表 VERIFIED，
+也不会触发测试、编译、Git commit、snapshot 或 rollback。
+
 ## 工具执行与安全边界
 
 核心工具为 `read_file`、`list_dir`、`search_code`、`apply_patch`、`run_command`
-和 `finish`。`write_file` 仅为旧调用兼容保留，新修改优先使用严格单次文本替换的
-`apply_patch`。工具按副作用分为：
+和 `finish`。`write_file` 只保留底层代码兼容，不再暴露给模型；模型修改文件必须使用
+由 EditResolver 唯一定位的结构化 `apply_patch`。工具按副作用分为：
 
 - `READ_ONLY`：`read_file`、`list_dir`、`search_code`；
 - `MUTATING`：`apply_patch`、兼容的 `write_file`；
@@ -115,6 +145,7 @@ python -m unittest -v
 python -m unittest -v test_planning.py
 python -m unittest -v test_context_manager.py
 python -m unittest -v test_tool_safety.py
+python -m unittest -v test_edit_resolver.py
 ```
 
 离线观察四个 phase 的上下文组成（不调用模型 API，也不修改 demo 文件）：
@@ -122,4 +153,5 @@ python -m unittest -v test_tool_safety.py
 ```powershell
 python demo_context.py
 python demo_tool_safety.py
+python demo_structured_edit.py
 ```
