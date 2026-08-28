@@ -7,6 +7,13 @@ from typing import Any
 
 
 APPLIED = "APPLIED"
+UNVERIFIED = "UNVERIFIED"
+VERIFIED = "VERIFIED"
+PARTIALLY_VERIFIED = "PARTIALLY_VERIFIED"
+REGRESSED = "REGRESSED"
+ROLLBACK_NONE = "NONE"
+UNDONE = "UNDONE"
+CHECKPOINT_ROLLED_BACK = "CHECKPOINT_ROLLED_BACK"
 TARGET_NOT_FOUND = "TARGET_NOT_FOUND"
 AMBIGUOUS_TARGET = "AMBIGUOUS_TARGET"
 STALE_EDIT = "STALE_EDIT"
@@ -66,9 +73,15 @@ class ChangeSet:
     intent: str
     before: str
     after: str
-    status: str
+    apply_status: str
+    verification_status: str
+    rollback_status: str
     step_id: str | None
     phase: str
+    checkpoint_base: str | None
+    start: int
+    context_before: str
+    context_after: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

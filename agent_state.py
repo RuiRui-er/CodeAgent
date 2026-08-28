@@ -62,6 +62,7 @@ class AgentState:
     relevant_files: list[str] = field(default_factory=list)
     relevant_symbols: list[str] = field(default_factory=list)
     change_sets: list[dict[str, Any]] = field(default_factory=list)
+    current_checkpoint: dict[str, Any] | None = None
 
     def planning_snapshot(self) -> dict[str, Any]:
         return asdict(self)
