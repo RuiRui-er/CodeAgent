@@ -195,6 +195,7 @@ python demo_tool_safety.py
 python demo_structured_edit.py
 python demo_checkpoint_recovery.py
 python demo_evidence_gated_verification.py
+python demo_failure_aware_recovery.py
 ```
 
 ## Evidence-Gated Verification
@@ -238,4 +239,49 @@ DEBUGGING，不自动回滚。Critical 缺少自动证据时保持非 DONE 并�
 ```powershell
 python -m unittest -v test_verification_engine.py
 python demo_evidence_gated_verification.py
+```
+
+## Failure-aware Recovery
+
+失败现在通过 `FailureEvent` 单独记录，不再只保留一段普通错误文本。事件包含 ID、粗粒度
+failure type、file/symbol/test location、环境 evidence、相关 ChangeSet 和 Criterion、当时的
+hypothesis/attempt、diagnostic hints、确定性 fingerprint、repeat count、step、phase、恢复
+结果以及失败编辑的 action signature。Failure history 与 `confirmed_facts` 完全分离。
+
+`FailureClassifier` 只附加 `BUILD_FAILED`、`TEST_FAILED`、`TIMEOUT`、`STALE_EDIT` 等粗粒度
+标签。它不会用分类结果替代错误内容：compiler/test/runtime 的 command、stdout、stderr、
+exit code、timeout 和原 ToolResult 截断标记都保存在 `evidence` 中。为了控制上下文，stdout
+与 stderr 分别使用固定字符上限和首尾保留策略，并分别标记是否发生二次截断；因此某个流
+过长不会导致另一个流从 evidence 中消失。Diagnostic hints 只是排查建议，不是事实或根因
+断言。
+
+`FailureMemory` 使用结构化稳定字段构造 fingerprint：测试失败使用 test/file/error category，
+构建失败使用 file/error category，超时使用规范化 command/current step，编辑失败使用
+file/symbol/criterion。临时路径、时间戳、随机 ID、完整行号和完整 stderr 不作为主要字段。
+相同 fingerprint 再次出现时追加新的历史事件并递增 `repeat_count`。
+
+普通失败首先进入 DEBUGGING。达到可配置的 `MAX_REPEAT_FAILURES` 后，如果存在多个 pending
+ChangeSets 且现有 CheckpointManager 明确允许安全 rollback，可以请求回到最近稳定点；
+随后进入已有 PLANNING phase。Acceptance Criteria、Verification Contract、baseline 和用户
+任务保持冻结，不会重新生成。
+
+重新规划分两次结构化提交：先提交 Failure Analysis，包含 previous hypothesis、observed
+evidence、previous attempts、之前尝试为何不充分、remaining possibilities、revised
+hypothesis 和 revised plan；下一次 PLANNING context 明确包含该分析后，才开放 Revised
+Execution Plan。系统不判断新旧计划在语义上是否相似，也没有 LLM judge、embedding 或
+fuzzy score。
+
+Duplicate Failed Action Guard 只比较完全相同的 file、symbol/anchor、operation、intent 和
+new block hash。命中时返回 `DUPLICATE_FAILED_ACTION`、原 failure ID 和原始失败 evidence；
+思想相似但具体修改不同的尝试不会被阻止。
+
+REGRESSION 的 Undo/Stable Checkpoint rollback 仍只由 VerificationEngine 执行，Failure
+Recovery 仅记录其现有 recovery result。只有缺少证据、没有真实 Critical FAIL 的
+UNVERIFIED 不创建 FailureEvent，继续走人工确认流程。
+
+离线验证：
+
+```powershell
+python -m unittest -v test_failure_recovery.py
+python demo_failure_aware_recovery.py
 ```
