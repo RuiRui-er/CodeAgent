@@ -20,6 +20,7 @@ from edit_models import (
     StructuredEditRequest,
 )
 from edit_resolver import EditResolver
+from failure_memory import FailureMemory
 from tool_registry import TOOLS, permission_result
 from tool_safety import CONFIRM, DENY, CommandPolicy, WorkspaceGuard
 
@@ -54,6 +55,7 @@ class ToolExecutor:
         self.command_policy = CommandPolicy(self.guard)
         self.confirm_callback = confirm_callback or self._confirm_with_input
         self.edit_resolver = EditResolver()
+        self.failure_memory = FailureMemory()
         self._change_counter = 0
         self.checkpoint_manager = CheckpointManager(self.root)
         self.checkpoint_manager.initialize()
@@ -193,6 +195,22 @@ class ToolExecutor:
                 self._log_edit(result)
                 return result
             request = StructuredEditRequest(file, operation, intent, symbol, anchor, old_block, new_block)
+
+            duplicate = self.failure_memory.duplicate_failed_action(state, {
+                "file": file,
+                "operation": operation,
+                "intent": intent,
+                "symbol": symbol,
+                "anchor": anchor,
+                "new_block": new_block,
+            })
+            if duplicate:
+                print("\n[Recovery]", flush=True)
+                print("Status: BLOCKED", flush=True)
+                print("Reason: DUPLICATE_FAILED_ACTION", flush=True)
+                print(f"Previous failure: {duplicate['related_failure']}", flush=True)
+                self._log_edit(duplicate, request)
+                return duplicate
 
         try:
             target = self.guard.resolve(file or "")

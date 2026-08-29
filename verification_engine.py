@@ -18,9 +18,10 @@ EVIDENCE_ORDER = {"SANITY": 0, "TARGET": 1, "REGRESSION": 2}
 class VerificationEngine:
     """Runs only pre-planned checks and applies discrete evidence rules."""
 
-    def __init__(self, tools: Any, failed_finish_limit: int = 2):
+    def __init__(self, tools: Any, failed_finish_limit: int = 2, failure_recovery: Any | None = None):
         self.tools = tools
         self.failed_finish_limit = max(1, int(failed_finish_limit))
+        self.failure_recovery = failure_recovery
 
     def run_final_verification(self, state: AgentState) -> dict[str, Any]:
         state.set_phase(VERIFYING)
@@ -145,18 +146,20 @@ class VerificationEngine:
             if final:
                 state.set_phase(DONE)
         elif status == REGRESSED:
-            evidence = {"kind": "NEW_REGRESSION", "new_failures": result.new_failures, "summary": result.evidence_summary}
-            state.failure_evidence.append(evidence)
-            state.failed_attempts.append({"attempt": "verification", "reason": result.evidence_summary})
+            if not self.failure_recovery:
+                evidence = {"kind": "NEW_REGRESSION", "new_failures": result.new_failures, "summary": result.evidence_summary}
+                state.failure_evidence.append(evidence)
+                state.failed_attempts.append({"attempt": "verification", "reason": result.evidence_summary})
             result.recovery_result = self._recover_regression(state)
             state.set_phase(DEBUGGING)
             if final:
                 state.failed_finish_attempts += 1
         else:
-            state.failure_evidence.extend(
-                {"kind": "CRITERION", "criterion_id": item["criterion_id"], "status": item["status"], "details": item["details"]}
-                for item in result.criterion_results if item["status"] != PASS
-            )
+            if not self.failure_recovery:
+                state.failure_evidence.extend(
+                    {"kind": "CRITERION", "criterion_id": item["criterion_id"], "status": item["status"], "details": item["details"]}
+                    for item in result.criterion_results if item["status"] != PASS
+                )
             if final:
                 state.failed_finish_attempts += 1
             failed_any = any(item["status"] == FAIL for item in result.criterion_results)
@@ -165,6 +168,10 @@ class VerificationEngine:
         state.verification_result = result.to_dict()
         if state.failed_finish_attempts >= self.failed_finish_limit:
             state.finish_guardrail_active = True
+        if self.failure_recovery:
+            failure = self.failure_recovery.handle_verification_result(state, state.verification_result)
+            if failure:
+                state.verification_result["failure_event"] = failure
         return state.verification_result
 
     def _recover_regression(self, state: AgentState) -> dict[str, Any]:
@@ -189,6 +196,7 @@ class VerificationEngine:
                 criterion.id, CRITERION_UNVERIFIED, criterion.evidence_type, "HUMAN_CONFIRMATION",
                 None, None, "Human confirmation required", criterion.verification_method,
                 [item.id for item in related],
+                [],
             )
         observed = [(check, observations[check.id]) for check in related if check.id in observations]
         if not observed:
@@ -196,6 +204,7 @@ class VerificationEngine:
                 criterion.id, CRITERION_UNVERIFIED, criterion.evidence_type, "NONE", None, None,
                 "No independent environment evidence", criterion.verification_method,
                 [item.id for item in related],
+                [],
             )
         baseline = {item["verification_id"]: item["observation"] for item in state.baseline}
         missing_regression_baseline = [
@@ -207,6 +216,7 @@ class VerificationEngine:
                 criterion.id, CRITERION_UNVERIFIED, criterion.evidence_type, "COMMAND", None, None,
                 "Regression baseline is unavailable", ", ".join(missing_regression_baseline),
                 [item.id for item, _ in observed],
+                [self._command_evidence(check, item) for check, item in observed],
             )
         failed = [
             (check, item) for check, item in observed
@@ -224,6 +234,7 @@ class VerificationEngine:
         return CriterionResult(
             criterion.id, status, criterion.evidence_type, "COMMAND", command, exit_code,
             summary, details, [item.id for item, _ in observed],
+            [self._command_evidence(check, item) for check, item in observed],
         )
 
     def _regression_check_passed(
@@ -293,6 +304,18 @@ class VerificationEngine:
     def _observation_detail(check: VerificationCheck, observation: dict[str, Any]) -> str:
         output = (observation.get("stdout") or observation.get("stderr") or "").strip()
         return f"{check.id}: exit={observation.get('exit_code')} {output[:1200]}"
+
+    @staticmethod
+    def _command_evidence(check: VerificationCheck, observation: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "verification_id": check.id,
+            "command": observation.get("command", check.command),
+            "status": observation.get("status"),
+            "exit_code": observation.get("exit_code"),
+            "stdout": observation.get("stdout", ""),
+            "stderr": observation.get("stderr", ""),
+            "truncated": observation.get("truncated", False),
+        }
 
     @staticmethod
     def _current_step_criteria(state: AgentState) -> list[str]:

@@ -23,6 +23,7 @@ class CriterionResult:
     summary: str
     details: str
     verification_ids: list[str] = field(default_factory=list)
+    evidence: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

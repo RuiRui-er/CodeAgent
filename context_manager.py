@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_state import DEBUGGING, EXECUTING, PLANNING, VERIFYING, AgentState
+from failure_memory import FailureMemory
 
 
 MAX_CONTEXT_CHARS = 18_000
@@ -20,6 +21,13 @@ PHASE_SECTION_BUDGETS = {
         "Acceptance Criteria": 2500,
         "Planning Findings": 4500,
         "Recent Actions": 4500,
+        "Replan Reason": 1200,
+        "Unmet Acceptance Criteria": 3000,
+        "Related Failure History": 6000,
+        "Previous Attempts": 3500,
+        "Last Stable Checkpoint": 1800,
+        "Working Evidence": 5000,
+        "Failure Analysis": 4500,
     },
     EXECUTING: {
         "Task": 2200,
@@ -47,6 +55,9 @@ PHASE_SECTION_BUDGETS = {
         "Task": 1600,
         "Current Step": 2200,
         "Failure Evidence": 4000,
+        "Current Failure": 7000,
+        "Related Criterion": 2200,
+        "Related ChangeSet": 2600,
         "Failed Attempts": 3000,
         "Failed Criteria": 3200,
         "Recovery Result": 2200,
@@ -99,12 +110,25 @@ class ContextManager:
 
     def _sections_for_phase(self, state: AgentState) -> list[tuple[str, Any]]:
         if state.current_phase == PLANNING:
-            return [
+            sections = [
                 ("Task", state.original_task),
                 ("Acceptance Criteria", [asdict(item) for item in state.acceptance_criteria]),
+            ]
+            if state.replan_reason:
+                sections.extend([
+                    ("Replan Reason", state.replan_reason),
+                    ("Unmet Acceptance Criteria", self._unmet_criteria(state)),
+                    ("Related Failure History", FailureMemory.related_failures(state)),
+                    ("Previous Attempts", state.failed_attempts[-6:]),
+                    ("Last Stable Checkpoint", state.current_checkpoint),
+                    ("Working Evidence", (state.current_failure or {}).get("evidence")),
+                    ("Failure Analysis", state.failure_analysis),
+                ])
+            sections.extend([
                 ("Planning Findings", state.confirmed_facts),
                 ("Recent Actions", state.recent_actions[-RECENT_ACTION_LIMIT:]),
-            ]
+            ])
+            return sections
         if state.current_phase == EXECUTING:
             return [
                 ("Task", state.original_task),
@@ -132,6 +156,9 @@ class ContextManager:
         return [
             ("Task", state.original_task),
             ("Current Step", self._current_step(state)),
+            ("Current Failure", state.current_failure),
+            ("Related Criterion", self._related_criterion(state)),
+            ("Related ChangeSet", self._related_changeset(state)),
             ("Failure Evidence", state.failure_evidence),
             ("Failed Attempts", state.failed_attempts),
             ("Failed Criteria", self._failed_criteria(state)),
@@ -140,6 +167,25 @@ class ContextManager:
             ("Relevant Code", self._read_relevant_code(state)),
             ("Recent Actions", state.recent_actions[-RECENT_ACTION_LIMIT:]),
         ]
+
+    @staticmethod
+    def _unmet_criteria(state: AgentState) -> list[dict[str, Any]]:
+        result = state.verification_result or {}
+        unmet = set(result.get("failed_critical", [])) | set(result.get("unverified_critical", []))
+        current = state.current_failure or {}
+        if current.get("related_criterion"):
+            unmet.add(current["related_criterion"])
+        return [asdict(item) for item in state.acceptance_criteria if item.id in unmet]
+
+    @staticmethod
+    def _related_criterion(state: AgentState) -> dict[str, Any] | None:
+        identifier = (state.current_failure or {}).get("related_criterion")
+        return next((asdict(item) for item in state.acceptance_criteria if item.id == identifier), None)
+
+    @staticmethod
+    def _related_changeset(state: AgentState) -> dict[str, Any] | None:
+        identifier = (state.current_failure or {}).get("related_changeset")
+        return next((item for item in state.change_sets if item.get("id") == identifier), None)
 
     @staticmethod
     def _failed_criteria(state: AgentState) -> list[dict[str, Any]]:

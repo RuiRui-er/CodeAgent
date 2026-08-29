@@ -15,6 +15,7 @@ from typing import Any
 from agent_state import (
     DEBUGGING,
     EXECUTING,
+    FAILED,
     PLANNING,
     VERIFYING,
     AcceptanceCriterion,
@@ -23,6 +24,8 @@ from agent_state import (
     VerificationCheck,
 )
 from context_manager import ContextManager
+from failure_models import FAILURE_ANALYSIS_FIELDS
+from failure_recovery import FailureRecovery
 from tool_executor import ToolExecutor
 from tool_registry import tool_schemas_for_phase
 from verification_engine import VerificationEngine
@@ -124,6 +127,52 @@ SUBMIT_PLAN_SCHEMA = {
                 "clarification_needed": {"type": ["string", "null"]},
             },
             "required": ["task_understanding", "acceptance_criteria", "verification_contract", "execution_plan", "clarification_needed"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+FAILURE_ANALYSIS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "submit_failure_analysis",
+        "description": "Submit structured analysis of the repeated evidence before revising the plan.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "failure_analysis": {
+                    "type": "object",
+                    "properties": {
+                        "previous_hypothesis": {"type": "string"},
+                        "observed_evidence": {"type": "string"},
+                        "previous_attempts": {"type": "array", "items": {"type": "string"}},
+                        "why_previous_attempt_was_insufficient": {"type": "string"},
+                        "remaining_possibilities": {"type": "array", "items": {"type": "string"}},
+                        "revised_hypothesis": {"type": "string"},
+                        "revised_plan": {"type": "string"},
+                    },
+                    "required": list(FAILURE_ANALYSIS_FIELDS),
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["failure_analysis"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+SUBMIT_REPLAN_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "submit_replan",
+        "description": "Submit a revised strategy after Failure Analysis without changing frozen criteria.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "execution_plan": SUBMIT_PLAN_SCHEMA["function"]["parameters"]["properties"]["execution_plan"],
+            },
+            "required": ["execution_plan"],
             "additionalProperties": False,
         },
     },
@@ -304,6 +353,7 @@ def _record_tool_event(
     result: dict[str, Any],
     trajectory: list[dict[str, Any]],
     allow_phase_changes: bool,
+    failure_recovery: FailureRecovery | None = None,
 ) -> None:
     trajectory.append({"tool": name, "arguments": arguments, "result": result})
     state.add_action({
@@ -327,12 +377,66 @@ def _record_tool_event(
     elif name == "finish" and succeeded:
         state.complete_current_step()
 
-    failure_statuses = {"FAILED", "TIMEOUT", "TARGET_NOT_FOUND", "STALE_EDIT", "INVALID_EDIT"}
-    if allow_phase_changes and result.get("status") in failure_statuses:
-        reason = _shorten(str(result.get("reason", result.get("stderr", "unknown tool error"))))
-        state.failed_attempts.append({"attempt": f"{name} {arguments}", "reason": reason})
-        state.failure_evidence.append({"tool": name, "arguments": arguments, "error": reason})
-        state.set_phase(DEBUGGING)
+    if allow_phase_changes and failure_recovery:
+        failure_recovery.handle_tool_result(state, name, arguments, result)
+
+
+def _validate_replan(payload: dict[str, Any], state: AgentState) -> None:
+    steps = [ExecutionStep(**item) for item in payload["execution_plan"]]
+    if not steps:
+        raise ValueError("revised execution plan cannot be empty")
+    known = {item.id for item in state.acceptance_criteria}
+    covered = {criterion for step in steps for criterion in step.related_acceptance_criteria}
+    if any(not set(step.related_acceptance_criteria) <= known for step in steps):
+        raise ValueError("revised plan refers to an unknown frozen criterion")
+    if covered != known:
+        raise ValueError("revised plan must still cover every frozen acceptance criterion")
+    state.execution_plan = steps
+    state.current_step = steps[0].step_id
+    state.replan_reason = None
+    state.set_phase(EXECUTING)
+
+
+def run_replanning(
+    state: AgentState,
+    tools: WorkspaceTools,
+    client: OpenAICompatibleClient,
+    context_manager: ContextManager,
+    max_steps: int = 3,
+) -> None:
+    prompt = """You are replanning because deterministic failure evidence repeated.
+Do not change the frozen Acceptance Criteria, Verification Contract, baseline, or user
+task. Inspect current files when needed, then submit a structured Failure Analysis and
+a revised execution plan. The previous hypothesis may still be valid; explain only why
+the previous attempt was insufficient. Do not judge whether plans are semantically
+similar and do not replay an identical failed edit.
+"""
+    for turn in range(1, max_steps + 1):
+        submit_schema = FAILURE_ANALYSIS_SCHEMA if state.failure_analysis is None else SUBMIT_REPLAN_SCHEMA
+        schemas = tool_schemas_for_phase(PLANNING) + [submit_schema]
+        messages = context_manager.build_messages(state, prompt)
+        log(f"REPLANNING STEP {turn}/{max_steps}", {"reason": state.replan_reason})
+        message = client.complete(messages, schemas)
+        for tool_call in message.get("tool_calls") or []:
+            name = tool_call.get("function", {}).get("name", "")
+            arguments, parse_error = _parse_tool_arguments(tool_call)
+            if parse_error:
+                state.add_action({"replanning_error": parse_error})
+                continue
+            if name == "submit_failure_analysis":
+                analysis = arguments["failure_analysis"]
+                if any(field not in analysis for field in FAILURE_ANALYSIS_FIELDS):
+                    raise ValueError("failure analysis is incomplete")
+                state.failure_analysis = analysis
+                log("Failure Analysis", state.failure_analysis)
+                break
+            if name == "submit_replan" and state.failure_analysis is not None:
+                _validate_replan(arguments, state)
+                log("Revised Execution Plan", [asdict(item) for item in state.execution_plan])
+                return
+            result = tools.call(state, name, arguments)
+            state.add_action({"tool": name, "arguments": arguments, "observation": _compact_observation(name, result)})
+    raise RuntimeError("replanning did not produce a valid Failure Analysis and revised plan")
 
 def _capture_baseline(state: AgentState, tools: WorkspaceTools) -> None:
     for check in state.verification_contract:
@@ -409,10 +513,13 @@ files as the only source of truth for current code.
 """
     state.set_phase(EXECUTING)
     context_manager = ContextManager(tools.root)
-    verification_engine = VerificationEngine(tools)
+    failure_recovery = FailureRecovery(tools)
+    verification_engine = VerificationEngine(tools, failure_recovery=failure_recovery)
     trajectory: list[dict[str, Any]] = []
 
     for step in range(1, max_steps + 1):
+        if state.current_phase == PLANNING:
+            run_replanning(state, tools, client, context_manager)
         messages = context_manager.build_messages(state, execution_prompt)
         log(f"STEP {step}/{max_steps} - MODEL REQUEST", {"trajectory_events": len(trajectory)})
         message = client.complete(messages, tool_schemas_for_phase(state.current_phase))
@@ -442,7 +549,12 @@ files as the only source of truth for current code.
                 log("TOOL CALL", {"name": name, "arguments": arguments})
                 result = tools.call(state, name, arguments)
             log("TOOL RESULT", result)
-            _record_tool_event(state, name, arguments, result, trajectory, allow_phase_changes=True)
+            _record_tool_event(
+                state, name, arguments, result, trajectory,
+                allow_phase_changes=True, failure_recovery=failure_recovery,
+            )
+            if state.current_phase == PLANNING:
+                break
             if name == "finish" and result.get("status") == "SUCCESS":
                 verification = verification_engine.run_final_verification(state)
                 log("FINAL VERIFICATION", verification)
@@ -463,6 +575,7 @@ files as the only source of truth for current code.
                 # additional tool calls bundled with the finish request.
                 break
 
+    state.set_phase(FAILED)
     final = f"Stopped after reaching the maximum of {max_steps} steps."
     log("AGENT STOPPED", final)
     return final
