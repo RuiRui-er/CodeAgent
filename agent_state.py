@@ -75,6 +75,9 @@ class AgentState:
     repeated_failure_count: int = 0
     replan_reason: str | None = None
     failure_analysis: dict[str, Any] | None = None
+    needs_user_confirmation: bool = False
+    verification_mode: str | None = None
+    phase_history: list[dict[str, Any]] = field(default_factory=list)
 
     def planning_snapshot(self) -> dict[str, Any]:
         return asdict(self)
