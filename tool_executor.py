@@ -80,7 +80,6 @@ class ToolExecutor:
             elif name == "run_command":
                 result = self.run_command(planning=request_phase == PLANNING, **arguments)
             elif name == "finish":
-                state.set_phase(VERIFYING)
                 result = {
                     "status": "SUCCESS",
                     "tool": name,

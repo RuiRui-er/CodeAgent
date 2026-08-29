@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_state import DEBUGGING, PLANNING
 from failure_classifier import FailureClassifier
 from failure_memory import FailureMemory
 from failure_models import REGRESSION_DETECTED, FailureEvent
 
 
 MAX_REPEAT_FAILURES = 3
+CONTINUE_DEBUGGING = "CONTINUE_DEBUGGING"
+REPLAN_DECISION = "REPLAN_REQUIRED"
 
 
 class FailureRecovery:
@@ -45,35 +46,28 @@ class FailureRecovery:
             "evidence": record["evidence"],
         })
 
-        action = "DEBUG"
+        decision = CONTINUE_DEBUGGING
         if record["type"] == REGRESSION_DETECTED:
             # VerificationEngine already performed the only recovery operation.
-            state.set_phase(DEBUGGING)
-            action = "RECORD_EXISTING_RECOVERY"
+            decision = CONTINUE_DEBUGGING
         elif record["repeat_count"] >= self.max_repeat_failures:
             rollback = None
             manager = self.tools.checkpoint_manager
             if len(manager.pending_changesets) > 1 and manager.can_rollback():
                 rollback = manager.rollback_last_stable(state, "repeated ordinary failure before replanning")
                 record["recovery_result"] = rollback
-            state.replan_reason = "repeated failure"
-            state.failure_analysis = None
-            state.set_phase(PLANNING)
-            action = "REPLAN"
-        else:
-            state.set_phase(DEBUGGING)
+            decision = REPLAN_DECISION
 
-        self._log(record, state.current_phase, action)
+        record["decision"] = decision
+        self._log(record, decision)
         return record
 
     @staticmethod
-    def _log(record: dict[str, Any], next_phase: str, action: str) -> None:
+    def _log(record: dict[str, Any], decision: str) -> None:
         print("\n[Failure]", flush=True)
         print(f"Type: {record['type']}", flush=True)
         if record.get("location"):
             print(f"Location: {record['location']}", flush=True)
         print(f"Fingerprint: {record['fingerprint']}", flush=True)
         print(f"Repeat: {record['repeat_count']}", flush=True)
-        if action != "DEBUG":
-            print(f"Action: {action}", flush=True)
-        print(f"Next phase: {next_phase}", flush=True)
+        print(f"Decision: {decision}", flush=True)

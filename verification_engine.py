@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable
 
-from agent_state import DEBUGGING, DONE, VERIFYING, AgentState, VerificationCheck
+from agent_state import AgentState, VerificationCheck
 from edit_models import PARTIALLY_VERIFIED, REGRESSED, UNVERIFIED, VERIFIED
 from verification_models import CRITERION_UNVERIFIED, FAIL, PASS, CriterionResult, VerificationResult
 
@@ -24,7 +24,6 @@ class VerificationEngine:
         self.failure_recovery = failure_recovery
 
     def run_final_verification(self, state: AgentState) -> dict[str, Any]:
-        state.set_phase(VERIFYING)
         result = self._run(state, FINAL, {item.id for item in state.acceptance_criteria})
         return self._apply_gate(state, result, final=True)
 
@@ -142,32 +141,20 @@ class VerificationEngine:
             )
             result.checkpoint_result = checkpoint
             state.current_checkpoint = manager.get_current_checkpoint()
-            state.failed_finish_attempts = 0
-            if final:
-                state.set_phase(DONE)
         elif status == REGRESSED:
             if not self.failure_recovery:
                 evidence = {"kind": "NEW_REGRESSION", "new_failures": result.new_failures, "summary": result.evidence_summary}
                 state.failure_evidence.append(evidence)
                 state.failed_attempts.append({"attempt": "verification", "reason": result.evidence_summary})
             result.recovery_result = self._recover_regression(state)
-            state.set_phase(DEBUGGING)
-            if final:
-                state.failed_finish_attempts += 1
         else:
             if not self.failure_recovery:
                 state.failure_evidence.extend(
                     {"kind": "CRITERION", "criterion_id": item["criterion_id"], "status": item["status"], "details": item["details"]}
                     for item in result.criterion_results if item["status"] != PASS
                 )
-            if final:
-                state.failed_finish_attempts += 1
-            failed_any = any(item["status"] == FAIL for item in result.criterion_results)
-            state.set_phase(DEBUGGING if failed_any else VERIFYING)
 
         state.verification_result = result.to_dict()
-        if state.failed_finish_attempts >= self.failed_finish_limit:
-            state.finish_guardrail_active = True
         if self.failure_recovery:
             failure = self.failure_recovery.handle_verification_result(state, state.verification_result)
             if failure:

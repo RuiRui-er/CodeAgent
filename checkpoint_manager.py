@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_state import DEBUGGING, AgentState
+from agent_state import AgentState
 from edit_models import (
     APPLIED,
     CHECKPOINT_ROLLED_BACK,
@@ -248,7 +248,6 @@ class CheckpointManager:
             change["rollback_status"] = CHECKPOINT_ROLLED_BACK
         self.pending_changesets.clear()
         state.current_checkpoint = checkpoint.to_dict()
-        state.set_phase(DEBUGGING)
         state.failed_attempts.append({"attempt": "stable checkpoint rollback", "reason": reason})
         state.add_action({
             "recovery": "STABLE_CHECKPOINT",

@@ -14,6 +14,7 @@ from typing import Any
 
 from agent_state import (
     DEBUGGING,
+    DONE,
     EXECUTING,
     FAILED,
     PLANNING,
@@ -23,6 +24,26 @@ from agent_state import (
     ExecutionStep,
     VerificationCheck,
 )
+from agent_events import (
+    CONTINUE_EXECUTION,
+    EDIT_APPLIED,
+    EDIT_FAILED,
+    FINAL_PARTIAL,
+    FINAL_VERIFIED,
+    FINISH_REQUESTED,
+    INCREMENTAL_PARTIAL,
+    INCREMENTAL_VERIFIED,
+    MAX_STEPS_REACHED,
+    PLAN_BLOCKED_BY_USER_INTENT,
+    PLAN_READY,
+    REPLAN_REQUIRED,
+    TARGET_FAILED,
+    TOOL_FAILED,
+    VERIFICATION_REGRESSED,
+    VERIFICATION_UNVERIFIED,
+    AgentEvent,
+)
+from agent_orchestrator import AgentOrchestrator
 from context_manager import ContextManager
 from failure_models import FAILURE_ANALYSIS_FIELDS
 from failure_recovery import FailureRecovery
@@ -354,7 +375,7 @@ def _record_tool_event(
     trajectory: list[dict[str, Any]],
     allow_phase_changes: bool,
     failure_recovery: FailureRecovery | None = None,
-) -> None:
+) -> dict[str, Any] | None:
     trajectory.append({"tool": name, "arguments": arguments, "result": result})
     state.add_action({
         "tool": name,
@@ -378,7 +399,8 @@ def _record_tool_event(
         state.complete_current_step()
 
     if allow_phase_changes and failure_recovery:
-        failure_recovery.handle_tool_result(state, name, arguments, result)
+        return failure_recovery.handle_tool_result(state, name, arguments, result)
+    return None
 
 
 def _validate_replan(payload: dict[str, Any], state: AgentState) -> None:
@@ -393,8 +415,6 @@ def _validate_replan(payload: dict[str, Any], state: AgentState) -> None:
         raise ValueError("revised plan must still cover every frozen acceptance criterion")
     state.execution_plan = steps
     state.current_step = steps[0].step_id
-    state.replan_reason = None
-    state.set_phase(EXECUTING)
 
 
 def run_replanning(
@@ -402,6 +422,7 @@ def run_replanning(
     tools: WorkspaceTools,
     client: OpenAICompatibleClient,
     context_manager: ContextManager,
+    orchestrator: AgentOrchestrator,
     max_steps: int = 3,
 ) -> None:
     prompt = """You are replanning because deterministic failure evidence repeated.
@@ -415,7 +436,7 @@ similar and do not replay an identical failed edit.
         submit_schema = FAILURE_ANALYSIS_SCHEMA if state.failure_analysis is None else SUBMIT_REPLAN_SCHEMA
         schemas = tool_schemas_for_phase(PLANNING) + [submit_schema]
         messages = context_manager.build_messages(state, prompt)
-        log(f"REPLANNING STEP {turn}/{max_steps}", {"reason": state.replan_reason})
+        log(f"FAILURE STRATEGY UPDATE {turn}/{max_steps}", {"reason": state.replan_reason})
         message = client.complete(messages, schemas)
         for tool_call in message.get("tool_calls") or []:
             name = tool_call.get("function", {}).get("name", "")
@@ -432,6 +453,7 @@ similar and do not replay an identical failed edit.
                 break
             if name == "submit_replan" and state.failure_analysis is not None:
                 _validate_replan(arguments, state)
+                orchestrator.transition(state, AgentEvent(PLAN_READY, "revised execution plan available"))
                 log("Revised Execution Plan", [asdict(item) for item in state.execution_plan])
                 return
             result = tools.call(state, name, arguments)
@@ -501,6 +523,7 @@ def run_execution(
     tools: WorkspaceTools,
     client: OpenAICompatibleClient,
     max_steps: int,
+    orchestrator: AgentOrchestrator | None = None,
 ) -> str:
     execution_prompt = SYSTEM_PROMPT + """
 
@@ -511,15 +534,21 @@ present. This stage may use all provided tools.
 The context is rebuilt from structured state before every request. Treat workspace
 files as the only source of truth for current code.
 """
-    state.set_phase(EXECUTING)
+    orchestrator = orchestrator or AgentOrchestrator()
+    if state.current_phase == PLANNING and state.execution_plan:
+        orchestrator.transition(state, AgentEvent(PLAN_READY, "execution plan available"))
     context_manager = ContextManager(tools.root)
     failure_recovery = FailureRecovery(tools)
     verification_engine = VerificationEngine(tools, failure_recovery=failure_recovery)
     trajectory: list[dict[str, Any]] = []
 
     for step in range(1, max_steps + 1):
+        if state.needs_user_confirmation:
+            final = _pause_summary(state)
+            log("AUTONOMOUS LOOP PAUSED", final)
+            return final
         if state.current_phase == PLANNING:
-            run_replanning(state, tools, client, context_manager)
+            run_replanning(state, tools, client, context_manager, orchestrator)
         messages = context_manager.build_messages(state, execution_prompt)
         log(f"STEP {step}/{max_steps} - MODEL REQUEST", {"trajectory_events": len(trajectory)})
         message = client.complete(messages, tool_schemas_for_phase(state.current_phase))
@@ -549,36 +578,115 @@ files as the only source of truth for current code.
                 log("TOOL CALL", {"name": name, "arguments": arguments})
                 result = tools.call(state, name, arguments)
             log("TOOL RESULT", result)
-            _record_tool_event(
+            failure = _record_tool_event(
                 state, name, arguments, result, trajectory,
                 allow_phase_changes=True, failure_recovery=failure_recovery,
             )
-            if state.current_phase == PLANNING:
-                break
             if name == "finish" and result.get("status") == "SUCCESS":
+                orchestrator.transition(state, AgentEvent(FINISH_REQUESTED, "model requested final verification"))
                 verification = verification_engine.run_final_verification(state)
                 log("FINAL VERIFICATION", verification)
-                overall = verification["overall_status"]
-                if overall in {"VERIFIED", "PARTIALLY_VERIFIED"}:
+                transition = _transition_verification(state, verification, orchestrator)
+                if transition.next_phase == DONE:
                     final = _verification_report(verification)
                     log("AGENT DONE", final)
                     return final
-                if (
-                    overall == "UNVERIFIED"
-                    and verification.get("unverified_critical")
-                    and state.current_phase == VERIFYING
-                ):
+                if transition.pause_autonomous_loop:
                     final = _verification_report(verification)
                     log("HUMAN CONFIRMATION REQUIRED", final)
                     return final
                 # A failed finish starts a fresh DEBUGGING decision; ignore any
                 # additional tool calls bundled with the finish request.
                 break
+            transition = _transition_tool_result(state, name, result, failure, orchestrator)
+            if transition and transition.next_phase == PLANNING:
+                break
 
-    state.set_phase(FAILED)
-    final = f"Stopped after reaching the maximum of {max_steps} steps."
+    orchestrator.transition(state, AgentEvent(MAX_STEPS_REACHED, f"maximum of {max_steps} model steps reached"))
+    final = _termination_summary(state, max_steps)
     log("AGENT STOPPED", final)
     return final
+
+
+def _transition_tool_result(
+    state: AgentState,
+    name: str,
+    result: dict[str, Any],
+    failure: dict[str, Any] | None,
+    orchestrator: AgentOrchestrator,
+):
+    status = result.get("status")
+    if status == "APPLIED" and name == "apply_patch":
+        return orchestrator.transition(state, AgentEvent(EDIT_APPLIED, "structured edit applied"))
+    if status == "SUCCESS" and name == "run_command" and state.current_phase == DEBUGGING:
+        return orchestrator.transition(state, AgentEvent(CONTINUE_EXECUTION, "debugging command succeeded"))
+    if status in {"SUCCESS", "APPLIED"}:
+        return None
+    event_type = EDIT_FAILED if name == "apply_patch" else TOOL_FAILED
+    transition = orchestrator.transition(state, AgentEvent(event_type, str(result.get("reason") or status)))
+    if failure and failure.get("decision") == "REPLAN_REQUIRED":
+        transition = orchestrator.transition(
+            state,
+            AgentEvent(REPLAN_REQUIRED, "repeated failure fingerprint", {"failure": failure}),
+        )
+    return transition
+
+
+def _transition_verification(
+    state: AgentState,
+    result: dict[str, Any],
+    orchestrator: AgentOrchestrator,
+):
+    overall = result["overall_status"]
+    mode = result.get("mode", state.verification_mode)
+    if overall == "VERIFIED":
+        event_type = FINAL_VERIFIED if mode == "FINAL" else INCREMENTAL_VERIFIED
+    elif overall == "PARTIALLY_VERIFIED":
+        event_type = FINAL_PARTIAL if mode == "FINAL" else INCREMENTAL_PARTIAL
+    elif overall == "REGRESSED":
+        event_type = VERIFICATION_REGRESSED
+    elif result.get("failed_critical"):
+        event_type = TARGET_FAILED
+    else:
+        event_type = VERIFICATION_UNVERIFIED
+    transition = orchestrator.transition(state, AgentEvent(event_type, result.get("evidence_summary", ""), result))
+    failure = result.get("failure_event") or {}
+    if transition.next_phase == DEBUGGING and failure.get("decision") == "REPLAN_REQUIRED":
+        transition = orchestrator.transition(
+            state,
+            AgentEvent(REPLAN_REQUIRED, "repeated failure fingerprint", {"failure": failure}),
+        )
+    return transition
+
+
+def _termination_summary(state: AgentState, max_steps: int) -> str:
+    result = state.verification_result or {}
+    pending = [
+        item["id"] for item in state.change_sets
+        if item.get("rollback_status") == "NONE" and item.get("verification_status") == "UNVERIFIED"
+    ]
+    summary = {
+        "reason": f"maximum of {max_steps} model steps reached",
+        "completed_criteria": result.get("verified_critical", []),
+        "unmet_criteria": sorted(set(result.get("failed_critical", []) + result.get("unverified_critical", []))),
+        "verification_status": result.get("overall_status"),
+        "last_failure": state.current_failure,
+        "pending_changesets": pending,
+        "current_checkpoint": state.current_checkpoint,
+        "phase_history": state.phase_history,
+    }
+    return "Agent reached MAX_AGENT_STEPS:\n" + json.dumps(summary, ensure_ascii=False, indent=2)
+
+
+def _pause_summary(state: AgentState) -> str:
+    result = state.verification_result or {}
+    return "Autonomous loop paused for user confirmation:\n" + json.dumps({
+        "phase": state.current_phase,
+        "clarification": state.clarification_needed,
+        "unverified_critical": result.get("unverified_critical", []),
+        "manual_confirmation_items": state.manual_confirmation_items,
+        "last_failure": state.current_failure,
+    }, ensure_ascii=False, indent=2)
 
 
 def _verification_report(result: dict[str, Any]) -> str:
@@ -600,14 +708,17 @@ def _verification_report(result: dict[str, Any]) -> str:
 def run_agent(task: str, workspace: Path, max_steps: int, max_planning_steps: int = 8) -> str:
     tools = WorkspaceTools(workspace)
     client = OpenAICompatibleClient()
+    orchestrator = AgentOrchestrator()
     log("PHASE", "PLANNING")
     state = run_planning(task, tools, client, max_planning_steps)
     if state.clarification_needed:
+        orchestrator.transition(state, AgentEvent(PLAN_BLOCKED_BY_USER_INTENT, state.clarification_needed))
         final = f"Clarification required before execution: {state.clarification_needed}"
         log("AGENT STOPPED", final)
         return final
+    orchestrator.transition(state, AgentEvent(PLAN_READY, "initial execution plan available"))
     log("PHASE", "EXECUTION")
-    return run_execution(state, tools, client, max_steps)
+    return run_execution(state, tools, client, max_steps, orchestrator)
 
 
 def parse_args() -> argparse.Namespace:
