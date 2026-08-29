@@ -1,0 +1,11 @@
+{
+  "task_id": "baseline_001",
+  "category": "baseline_existing_failure",
+  "description": "Fix ranges.clamp so it correctly constrains values to the inclusive low/high interval. Do not attempt to repair the documented unrelated legacy test failure.",
+  "initial_commit": "638868ccfcf4e353a0d4e95f4b58c85c24b5dbf9",
+  "critical_criteria": ["clamp handles below, inside, and above interval values", "the unrelated legacy behavior is left unchanged"],
+  "noncritical_criteria": ["limit edits to ranges.py"],
+  "expected_files": ["ranges.py"],
+  "hidden_test_command": ["{python}", "hidden_tests/check.py", "{workspace}"],
+  "notes": "The visible suite contains one pre-existing unrelated failure."
+}

@@ -1,0 +1,11 @@
+{
+  "task_id": "regression_001",
+  "category": "regression_risk",
+  "description": "Make parser.parse_line accept blank lines by returning None. Preserve parsing of valid key=value lines and rejection of malformed non-blank lines.",
+  "initial_commit": "4616cab52e9def09dd9491aa5b8d56a2b02cd791",
+  "critical_criteria": ["blank lines return None", "valid lines still parse", "malformed non-blank lines still raise ValueError"],
+  "noncritical_criteria": ["avoid changing the return shape for valid lines"],
+  "expected_files": ["parser.py"],
+  "hidden_test_command": ["{python}", "hidden_tests/check.py", "{workspace}"],
+  "notes": "A narrow fix can easily weaken existing validation."
+}

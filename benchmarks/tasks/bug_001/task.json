@@ -1,0 +1,11 @@
+{
+  "task_id": "bug_001",
+  "category": "ordinary_bug",
+  "description": "Fix stats.average so an empty input returns 0, while preserving the existing behavior for non-empty inputs. Run the available tests.",
+  "initial_commit": "0dbcc4fdbfdf8ead0c128ac170eb877146e70e30",
+  "critical_criteria": ["average([]) returns 0", "non-empty averages remain correct"],
+  "noncritical_criteria": ["keep the change focused"],
+  "expected_files": ["stats.py"],
+  "hidden_test_command": ["{python}", "hidden_tests/check.py", "{workspace}"],
+  "notes": "Ordinary localized bug fix."
+}

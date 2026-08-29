@@ -1,0 +1,11 @@
+{
+  "task_id": "ambiguous_001",
+  "category": "ambiguous_edit_location",
+  "description": "Update only formatters.format_title so it trims surrounding whitespace and converts the text to title case. format_code must remain trim-only.",
+  "initial_commit": "96cad90da76370425ced1eeb461ec830ea6a5fee",
+  "critical_criteria": ["format_title trims and title-cases", "format_code remains trim-only"],
+  "noncritical_criteria": ["edit only the intended function"],
+  "expected_files": ["formatters.py"],
+  "hidden_test_command": ["{python}", "hidden_tests/check.py", "{workspace}"],
+  "notes": "Two similar implementations make an imprecise edit risky."
+}
