@@ -11,7 +11,8 @@ EXECUTING = "EXECUTING"
 VERIFYING = "VERIFYING"
 DEBUGGING = "DEBUGGING"
 DONE = "DONE"
-PHASES = {PLANNING, EXECUTING, VERIFYING, DEBUGGING, DONE}
+FAILED = "FAILED"
+PHASES = {PLANNING, EXECUTING, VERIFYING, DEBUGGING, DONE, FAILED}
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,11 @@ class AgentState:
     failed_finish_attempts: int = 0
     finish_guardrail_active: bool = False
     verification_sequence: int = 0
+    failure_history: list[dict[str, Any]] = field(default_factory=list)
+    current_failure: dict[str, Any] | None = None
+    repeated_failure_count: int = 0
+    replan_reason: str | None = None
+    failure_analysis: dict[str, Any] | None = None
 
     def planning_snapshot(self) -> dict[str, Any]:
         return asdict(self)
