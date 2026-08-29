@@ -4,10 +4,12 @@ import unittest
 import uuid
 from pathlib import Path
 
-from agent_state import DEBUGGING, DONE, VERIFYING, AcceptanceCriterion, AgentState, VerificationCheck
+from agent_state import DEBUGGING, DONE, EXECUTING, VERIFYING, AcceptanceCriterion, AgentState, VerificationCheck
+from agent_events import FINISH_REQUESTED, AgentEvent
+from agent_orchestrator import AgentOrchestrator
 from edit_models import PARTIALLY_VERIFIED, REGRESSED, UNVERIFIED, VERIFIED
 from context_manager import ContextManager
-from coding_agent import run_execution
+from coding_agent import _transition_verification, run_execution
 from verification_engine import VerificationEngine
 
 
@@ -60,7 +62,6 @@ class FakeTools:
 
     def call(self, state, name, arguments):
         if name == "finish":
-            state.set_phase(VERIFYING)
             return {"status": "SUCCESS", "tool": "finish", "next_phase": VERIFYING}
         self.calls.append(arguments["command"][0])
         return self.results[arguments["command"][0]].pop(0)
@@ -108,6 +109,7 @@ class VerificationEngineTests(unittest.TestCase):
             checks = [check("target", "TARGET", "AC_TARGET")]
             tools = FakeTools({"target": [observation(False)]}, directory)
             state = make_state(criteria, checks)
+            state.set_phase(EXECUTING)
 
             report = run_execution(state, tools, FinishClient(), max_steps=1)
 
@@ -128,6 +130,7 @@ class VerificationEngineTests(unittest.TestCase):
         state = make_state(criteria, checks, baseline)
 
         result = VerificationEngine(tools).run_final_verification(state)
+        _transition_verification(state, result, AgentOrchestrator())
 
         self.assertEqual(result["overall_status"], VERIFIED)
         self.assertEqual(result["new_failures"], [])
@@ -146,6 +149,7 @@ class VerificationEngineTests(unittest.TestCase):
         state = make_state(criteria, checks)
 
         result = VerificationEngine(tools).run_final_verification(state)
+        _transition_verification(state, result, AgentOrchestrator())
 
         self.assertEqual(result["overall_status"], PARTIALLY_VERIFIED)
         self.assertEqual(result["manual_items"], ["AC_DOC"])
@@ -164,6 +168,7 @@ class VerificationEngineTests(unittest.TestCase):
         state = make_state(criteria, checks, baseline)
 
         result = VerificationEngine(tools).run_final_verification(state)
+        _transition_verification(state, result, AgentOrchestrator())
 
         self.assertEqual(result["overall_status"], REGRESSED)
         self.assertEqual(result["new_failures"], ["tests/test_new.py::test_new"])
@@ -178,10 +183,12 @@ class VerificationEngineTests(unittest.TestCase):
         state = make_state(criteria, checks)
 
         result = VerificationEngine(tools).run_final_verification(state)
+        transition = _transition_verification(state, result, AgentOrchestrator())
 
         self.assertEqual(result["overall_status"], UNVERIFIED)
         self.assertEqual(result["unverified_critical"], ["AC_HUMAN"])
         self.assertEqual(state.current_phase, VERIFYING)
+        self.assertTrue(transition.needs_user_confirmation)
         self.assertEqual(tools.checkpoint_manager.stable_calls, 0)
 
     def test_target_failure_without_regression_keeps_changes_and_debugs(self):
@@ -194,7 +201,9 @@ class VerificationEngineTests(unittest.TestCase):
         tools = FakeTools({"target": [observation(False)], "regression": [observation(True)]})
         state = make_state(criteria, checks, baseline)
 
+        orchestrator = AgentOrchestrator(failed_finish_limit=2)
         result = VerificationEngine(tools, failed_finish_limit=2).run_final_verification(state)
+        _transition_verification(state, result, orchestrator)
 
         self.assertEqual(result["overall_status"], UNVERIFIED)
         self.assertEqual(result["failed_critical"], ["AC_TARGET"])
@@ -205,7 +214,9 @@ class VerificationEngineTests(unittest.TestCase):
 
         tools.results["target"] = [observation(False)]
         tools.results["regression"] = [observation(True)]
-        VerificationEngine(tools, failed_finish_limit=2).run_final_verification(state)
+        orchestrator.transition(state, AgentEvent(FINISH_REQUESTED, "retry final verification"))
+        second = VerificationEngine(tools, failed_finish_limit=2).run_final_verification(state)
+        _transition_verification(state, second, orchestrator)
         self.assertEqual(state.failed_finish_attempts, 2)
         self.assertTrue(state.finish_guardrail_active)
         directory = Path(__file__).parent / ".test_workspaces" / f"context_{uuid.uuid4().hex}"

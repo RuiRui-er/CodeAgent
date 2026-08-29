@@ -13,6 +13,9 @@ from pathlib import Path
 from agent_state import EXECUTING, AcceptanceCriterion, AgentState, VerificationCheck
 from tool_executor import ToolExecutor
 from verification_engine import VerificationEngine
+from agent_events import FINISH_REQUESTED, AgentEvent
+from agent_orchestrator import AgentOrchestrator
+from coding_agent import _transition_verification
 
 
 ROOT = Path(__file__).parent / ".demo_verification_runtime"
@@ -109,7 +112,10 @@ def run_scenario(label: str, value: str, include_human: bool = False, human_crit
     root, tools = make_repo(label)
     state = state_with_contract(tools, include_human, human_critical)
     apply_state(tools, state, value)
+    orchestrator = AgentOrchestrator()
+    orchestrator.transition(state, AgentEvent(FINISH_REQUESTED, "demo final verification"))
     result = VerificationEngine(tools).run_final_verification(state)
+    _transition_verification(state, result, orchestrator)
     print(f"\n=== {label} ===")
     print("overall:", result["overall_status"])
     print("baseline failures:", result["baseline_failures"])

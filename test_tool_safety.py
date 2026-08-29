@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 
 from agent_state import EXECUTING, PLANNING, VERIFYING, AgentState
+from agent_events import FINISH_REQUESTED, AgentEvent
+from agent_orchestrator import AgentOrchestrator
 from tool_executor import ToolExecutor, truncate_command_output
 from tool_safety import CONFIRM, DENY, SAFE
 
@@ -23,6 +25,8 @@ class ToolSafetyTests(unittest.TestCase):
         state.set_phase(EXECUTING)
         finish = self.tools.call(state, "finish", {"summary": "ready"})
         self.assertEqual(finish["done"], False)
+        self.assertEqual(state.current_phase, EXECUTING)
+        AgentOrchestrator().transition(state, AgentEvent(FINISH_REQUESTED, "test finish"))
         self.assertEqual(state.current_phase, VERIFYING)
         repeated = self.tools.call(state, "finish", {})
         self.assertEqual(repeated["status"], "BLOCKED")

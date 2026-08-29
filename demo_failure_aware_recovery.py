@@ -11,6 +11,8 @@ from context_manager import ContextManager
 from failure_classifier import FailureClassifier
 from failure_recovery import FailureRecovery
 from tool_executor import ToolExecutor
+from agent_events import REPLAN_REQUIRED, TOOL_FAILED, AgentEvent
+from agent_orchestrator import AgentOrchestrator
 
 
 class DemoCheckpointManager:
@@ -61,10 +63,13 @@ def main() -> None:
 
         print("\n=== Repeated fingerprint triggers PLANNING ===")
         recovery = FailureRecovery(DemoTools(root), max_repeat_failures=3)
+        orchestrator = AgentOrchestrator()
         failed_test = examples[1][3]
         for _ in range(3):
-            state.set_phase(EXECUTING)
             record = recovery.handle_tool_result(state, "run_command", {}, failed_test)
+            orchestrator.transition(state, AgentEvent(TOOL_FAILED, "demo test failed"))
+            if record["decision"] == "REPLAN_REQUIRED":
+                orchestrator.transition(state, AgentEvent(REPLAN_REQUIRED, "repeated failure fingerprint"))
             print(record["fingerprint"], "repeat", record["repeat_count"], "phase", state.current_phase)
 
         state.failure_analysis = {

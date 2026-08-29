@@ -196,6 +196,49 @@ python demo_structured_edit.py
 python demo_checkpoint_recovery.py
 python demo_evidence_gated_verification.py
 python demo_failure_aware_recovery.py
+python demo_state_machine.py
+```
+
+## 状态机收口
+
+`AgentOrchestrator` 是现有能力之间的协调层，不是新的 Agent 核心能力。ToolExecutor、
+VerificationEngine、FailureRecovery 和 CheckpointManager 分别继续负责工具结果、证据判定、
+失败决策和 Git 恢复；它们不再直接修改 lifecycle phase。主循环把结果转换成有限的
+`AgentEvent`，由 Orchestrator 返回 `TransitionResult` 并唯一更新 `current_phase`。
+
+保留的 phase 只有：`PLANNING / EXECUTING / VERIFYING / DEBUGGING / DONE / FAILED`。
+没有 DECIDING、REPLANNING、VERIFIED_SUCCESS 或 WAITING_USER，也没有 EventBus、workflow
+engine 或 graph framework。
+
+主要事件包括：PLAN_READY、PLAN_BLOCKED_BY_USER_INTENT、TOOL_FAILED、EDIT_APPLIED、
+EDIT_FAILED、FINISH_REQUESTED、VERIFICATION_REQUESTED、INCREMENTAL_VERIFIED、
+INCREMENTAL_PARTIAL、FINAL_VERIFIED、FINAL_PARTIAL、VERIFICATION_REGRESSED、
+TARGET_FAILED、VERIFICATION_UNVERIFIED、REPLAN_REQUIRED、USER_CONFIRMATION_REQUIRED、
+USER_CONFIRMED、MAX_STEPS_REACHED 和 UNRECOVERABLE_FAILURE。
+
+`TransitionResult` 明确记录 previous phase、event、next phase、reason、是否暂停自动循环以及
+是否需要用户确认。每次合法迁移还会向 `AgentState.phase_history` 追加 from/event/to/reason，
+不保存 prompt。
+
+Final 与 incremental verification 由事件明确区分：finish 只能产生 FINAL VERIFYING，final
+VERIFIED/PARTIAL 才能进入 DONE；incremental VERIFIED/PARTIAL 返回 EXECUTING。REGRESSED
+在 VerificationEngine 完成既有 recovery 后通过事件进入 DEBUGGING；Critical Target FAIL
+同样进入 DEBUGGING。证据不足的 UNVERIFIED 保持 VERIFYING，设置
+`needs_user_confirmation=true` 并暂停自动循环。
+
+FailureRecovery 只返回 `CONTINUE_DEBUGGING` 或 `REPLAN_REQUIRED` decision。重复失败的
+DEBUGGING → PLANNING 由 Orchestrator 完成。CheckpointManager rollback 也只返回恢复结果，
+不再隐式切 phase。
+
+MAX_AGENT_STEPS 从任意非 terminal phase 统一进入 FAILED，并生成 criteria、verification、
+last failure、pending ChangeSets、stable checkpoint 和 phase history 摘要。DONE/FAILED 是
+terminal phase，任何后续 transition 都会被拒绝。
+
+状态机一致性检查和离线演示：
+
+```powershell
+python -m unittest -v test_agent_orchestrator.py
+python demo_state_machine.py
 ```
 
 ## Evidence-Gated Verification

@@ -5,6 +5,8 @@ from pathlib import Path
 
 from agent_state import EXECUTING, PLANNING, AgentState
 from tool_executor import ToolExecutor
+from agent_events import FINISH_REQUESTED, AgentEvent
+from agent_orchestrator import AgentOrchestrator
 
 
 def show(title: str, result: dict) -> None:
@@ -27,7 +29,8 @@ def main() -> None:
     show("EXECUTING safe command succeeds", tools.call(state, "run_command", {"command": [sys.executable, "--version"]}))
     show("CONFIRM command is rejected by user", tools.call(state, "run_command", {"command": ["git", "clean", "-fd"]}))
     show("DENY command is rejected", tools.call(state, "run_command", {"command": ["shutdown", "/s"]}))
-    show("finish enters VERIFYING", tools.call(state, "finish", {"summary": "Implementation ready for verification."}))
+    show("finish requests VERIFYING", tools.call(state, "finish", {"summary": "Implementation ready for verification."}))
+    AgentOrchestrator().transition(state, AgentEvent(FINISH_REQUESTED, "demo finish"))
     print(f"Current phase: {state.current_phase}")
 
 

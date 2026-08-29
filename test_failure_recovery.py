@@ -5,6 +5,8 @@ import uuid
 from pathlib import Path
 
 from agent_state import DEBUGGING, EXECUTING, PLANNING, AcceptanceCriterion, AgentState, ExecutionStep
+from agent_events import REPLAN_REQUIRED, TOOL_FAILED, AgentEvent
+from agent_orchestrator import AgentOrchestrator
 from coding_agent import run_replanning
 from context_manager import ContextManager
 from failure_classifier import FailureClassifier
@@ -132,21 +134,24 @@ class FailureRecoveryTests(unittest.TestCase):
         state = state_for_failure()
         tools = FakeTools(self.base)
         recovery = FailureRecovery(tools, max_repeat_failures=3)
+        orchestrator = AgentOrchestrator()
         failure_result = {
             "status": "FAILED", "command": "python -m unittest test_parser.py", "exit_code": 1,
             "stdout": "FAIL: test_empty_input", "stderr": "AssertionError: expected []", "truncated": False,
         }
         for expected in (1, 2, 3):
-            state.set_phase(EXECUTING)
             record = recovery.handle_tool_result(state, "run_command", {}, failure_result)
             self.assertEqual(record["repeat_count"], expected)
+            orchestrator.transition(state, AgentEvent(TOOL_FAILED, "test command failed"))
+            if record["decision"] == "REPLAN_REQUIRED":
+                orchestrator.transition(state, AgentEvent(REPLAN_REQUIRED, "repeated failure fingerprint"))
         self.assertEqual(state.current_phase, PLANNING)
-        self.assertEqual(state.replan_reason, "repeated failure")
+        self.assertEqual(state.replan_reason, "repeated failure fingerprint")
         self.assertEqual(len(state.failure_history), 3)
         self.assertNotIn(state.current_failure, state.confirmed_facts)
 
         client = ReplanClient()
-        run_replanning(state, tools, client, ContextManager(self.base))
+        run_replanning(state, tools, client, ContextManager(self.base), orchestrator)
         self.assertIn("submit_failure_analysis", client.tool_names[0])
         self.assertNotIn("submit_replan", client.tool_names[0])
         self.assertIn("submit_replan", client.tool_names[1])

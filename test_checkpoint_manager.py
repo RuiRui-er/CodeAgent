@@ -94,7 +94,7 @@ class CheckpointManagerTests(unittest.TestCase):
 
         rolled_back = manager.rollback_last_stable(state, "state confused")
         self.assertEqual(rolled_back["status"], "ROLLED_BACK")
-        self.assertEqual(state.current_phase, DEBUGGING)
+        self.assertEqual(state.current_phase, EXECUTING)
         self.assertIn("return 2", (self.root / "app.py").read_text(encoding="utf-8"))
         self.assertEqual(covered["change_set"]["rollback_status"], CHECKPOINT_ROLLED_BACK)
         self.assertEqual(latest["change_set"]["rollback_status"], CHECKPOINT_ROLLED_BACK)
