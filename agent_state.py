@@ -75,6 +75,11 @@ class AgentState:
     failure_history: list[dict[str, Any]] = field(default_factory=list)
     current_failure: dict[str, Any] | None = None
     repeated_failure_count: int = 0
+    consecutive_failure_fingerprint: str | None = None
+    consecutive_failure_count: int = 0
+    replan_attempts_by_fingerprint: dict[str, int] = field(default_factory=dict)
+    no_progress_replan_count: int = 0
+    no_progress_fingerprint: str | None = None
     replan_reason: str | None = None
     failure_analysis: dict[str, Any] | None = None
     needs_user_confirmation: bool = False

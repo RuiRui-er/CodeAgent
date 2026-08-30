@@ -39,6 +39,7 @@ from agent_events import (
     REPLAN_REQUIRED,
     TARGET_FAILED,
     TOOL_FAILED,
+    UNRECOVERABLE_FAILURE,
     VERIFICATION_REGRESSED,
     VERIFICATION_REQUESTED,
     VERIFICATION_UNVERIFIED,
@@ -860,6 +861,11 @@ def _transition_tool_result(
             state,
             AgentEvent(REPLAN_REQUIRED, "repeated failure fingerprint", {"failure": failure}),
         )
+    elif failure and failure.get("decision") == "UNRECOVERABLE_FAILURE":
+        transition = orchestrator.transition(
+            state,
+            AgentEvent(UNRECOVERABLE_FAILURE, "same failure persisted across replans", {"failure": failure}),
+        )
     return transition
 
 
@@ -886,6 +892,11 @@ def _transition_verification(
         transition = orchestrator.transition(
             state,
             AgentEvent(REPLAN_REQUIRED, "repeated failure fingerprint", {"failure": failure}),
+        )
+    elif transition.next_phase == DEBUGGING and failure.get("decision") == "UNRECOVERABLE_FAILURE":
+        transition = orchestrator.transition(
+            state,
+            AgentEvent(UNRECOVERABLE_FAILURE, "same verification failure persisted across replans", {"failure": failure}),
         )
     return transition
 

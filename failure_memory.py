@@ -15,8 +15,14 @@ class FailureMemory:
         event.fingerprint = self.build_fingerprint(event)
         previous = [item for item in state.failure_history if item.get("fingerprint") == event.fingerprint]
         event.repeat_count = len(previous) + 1
+        if state.consecutive_failure_fingerprint == event.fingerprint:
+            state.consecutive_failure_count += 1
+        else:
+            state.consecutive_failure_fingerprint = event.fingerprint
+            state.consecutive_failure_count = 1
         event.id = f"failure_{len(state.failure_history) + 1:04d}"
         record = event.to_dict()
+        record["consecutive_repeat_count"] = state.consecutive_failure_count
         state.failure_history.append(record)
         state.current_failure = record
         state.repeated_failure_count = event.repeat_count

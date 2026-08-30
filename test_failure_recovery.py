@@ -4,10 +4,10 @@ import unittest
 import uuid
 from pathlib import Path
 
-from agent_state import DEBUGGING, EXECUTING, PLANNING, AcceptanceCriterion, AgentState, ExecutionStep
+from agent_state import DEBUGGING, EXECUTING, FAILED, PLANNING, AcceptanceCriterion, AgentState, ExecutionStep
 from agent_events import REPLAN_REQUIRED, TOOL_FAILED, AgentEvent
 from agent_orchestrator import AgentOrchestrator
-from coding_agent import run_replanning
+from coding_agent import _transition_tool_result, run_replanning
 from context_manager import ContextManager
 from failure_classifier import FailureClassifier
 from failure_memory import FailureMemory
@@ -161,6 +161,32 @@ class FailureRecoveryTests(unittest.TestCase):
         self.assertIn("AssertionError", second_context)
         self.assertEqual(state.current_phase, EXECUTING)
         self.assertEqual(state.acceptance_criteria[0].id, "AC1")
+
+    def test_same_fingerprint_across_replans_becomes_unrecoverable(self):
+        state = state_for_failure()
+        tools = FakeTools(self.base)
+        recovery = FailureRecovery(tools, max_repeat_failures=3, max_no_progress_replans=2)
+        failure_result = {
+            "status": "FAILED", "command": "python -m unittest test_parser.py", "exit_code": 1,
+            "stdout": "FAIL: test_empty_input", "stderr": "AssertionError: expected []", "truncated": False,
+        }
+        cycle_decisions = []
+        last_record = None
+        for _cycle in range(3):
+            for expected_consecutive in (1, 2, 3):
+                last_record = recovery.handle_tool_result(state, "run_command", {}, failure_result)
+                self.assertEqual(last_record["consecutive_repeat_count"], expected_consecutive)
+            cycle_decisions.append(last_record["decision"])
+
+        self.assertEqual(cycle_decisions, ["REPLAN_REQUIRED", "REPLAN_REQUIRED", "UNRECOVERABLE_FAILURE"])
+        self.assertEqual(state.no_progress_replan_count, 2)
+        self.assertEqual(state.no_progress_fingerprint, last_record["fingerprint"])
+
+        state.current_phase = EXECUTING
+        transition = _transition_tool_result(
+            state, "run_command", failure_result, last_record, AgentOrchestrator(),
+        )
+        self.assertEqual(transition.next_phase, FAILED)
 
     def test_duplicate_failed_edit_is_blocked_with_previous_evidence(self):
         (self.base / "parser.py").write_text("def parse():\n    return []\n", encoding="utf-8")
