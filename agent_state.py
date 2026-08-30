@@ -78,6 +78,9 @@ class AgentState:
     needs_user_confirmation: bool = False
     verification_mode: str | None = None
     phase_history: list[dict[str, Any]] = field(default_factory=list)
+    planning_validation_failures: int = 0
+    planning_repair_attempts: int = 0
+    planning_repair_success: bool = False
 
     def planning_snapshot(self) -> dict[str, Any]:
         return asdict(self)

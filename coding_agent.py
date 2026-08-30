@@ -50,6 +50,13 @@ from failure_recovery import FailureRecovery
 from tool_executor import ToolExecutor
 from tool_registry import tool_schemas_for_phase
 from verification_engine import VerificationEngine
+from planning_schema import (
+    MAX_PLANNING_REPAIR_ATTEMPTS,
+    PlanningSchemaError,
+    build_repair_instruction,
+    validate_acceptance_criteria_preserved,
+    validate_schema,
+)
 
 # Import compatibility for callers of the earlier single-file implementation.
 WorkspaceTools = ToolExecutor
@@ -263,6 +270,7 @@ def _parse_tool_arguments(tool_call: dict[str, Any]) -> tuple[dict[str, Any], st
 
 
 def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
+    validate_schema(payload, SUBMIT_PLAN_SCHEMA["function"]["parameters"])
     criteria = [AcceptanceCriterion(**item) for item in payload["acceptance_criteria"]]
     checks = [VerificationCheck(**item) for item in payload["verification_contract"]]
     steps = [ExecutionStep(**item) for item in payload["execution_plan"]]
@@ -275,8 +283,12 @@ def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
     step_ids = [item.step_id for item in steps]
     if len(step_ids) != len(set(step_ids)):
         raise ValueError("execution step IDs must be unique")
-    if any(not item.verification_method.strip() for item in criteria):
-        raise ValueError("every acceptance criterion needs a verification_method")
+    for item in [*criteria, *checks]:
+        if not _specific_verification_method(item.verification_method):
+            raise ValueError(
+                f"verification_method for {item.id} must name a concrete command, test, "
+                "input/output check, or manual procedure and required result"
+            )
     known = set(criterion_ids)
     for check in checks:
         if not set(check.related_acceptance_criteria) <= known:
@@ -307,6 +319,61 @@ def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
     state.current_step = steps[0].step_id
     state.clarification_needed = payload.get("clarification_needed")
     return state
+
+
+def _specific_verification_method(method: str) -> bool:
+    normalized = " ".join(method.lower().split())
+    if len(normalized) < 16:
+        return False
+    vague = {"verify feature works", "verify it works", "check correctness", "test feature"}
+    return normalized not in vague
+
+
+def _repair_plan(
+    payload: dict[str, Any],
+    validation_error: str,
+    state: AgentState,
+    client: OpenAICompatibleClient,
+    context_manager: ContextManager,
+) -> AgentState:
+    current_payload = payload
+    current_error = validation_error
+    for attempt in range(1, MAX_PLANNING_REPAIR_ATTEMPTS + 1):
+        state.planning_repair_attempts += 1
+        prompt = build_repair_instruction(current_payload, current_error, attempt)
+        messages = context_manager.build_messages(state, PLANNING_PROMPT)
+        messages.append({"role": "user", "content": prompt})
+        log(f"PLANNING SCHEMA REPAIR {attempt}/{MAX_PLANNING_REPAIR_ATTEMPTS}", current_error)
+        message = client.complete(messages, [SUBMIT_PLAN_SCHEMA])
+        calls = message.get("tool_calls") or []
+        submit = next(
+            (call for call in calls if call.get("function", {}).get("name") == "submit_plan"),
+            None,
+        )
+        if submit is None:
+            current_error = "$: repair response must contain exactly a submit_plan tool call"
+            state.planning_validation_failures += 1
+            continue
+        repaired, parse_error = _parse_tool_arguments(submit)
+        if parse_error:
+            current_error = parse_error
+            state.planning_validation_failures += 1
+            current_payload = repaired
+            continue
+        try:
+            validate_acceptance_criteria_preserved(payload, repaired)
+            repaired_state = _validate_plan(repaired, state)
+        except (KeyError, TypeError, ValueError, PlanningSchemaError) as exc:
+            current_error = str(exc)
+            current_payload = repaired
+            state.planning_validation_failures += 1
+            continue
+        state.planning_repair_success = True
+        return repaired_state
+    raise RuntimeError(
+        f"PLANNING schema repair failed after {MAX_PLANNING_REPAIR_ATTEMPTS} attempts; "
+        f"last validation error: {current_error}"
+    )
 
 
 def _shorten(text: str, limit: int = 1200) -> str:
@@ -509,8 +576,17 @@ def run_planning(
                     log("Baseline", state.baseline)
                     log("Execution Plan", [asdict(item) for item in state.execution_plan])
                     return state
-                except (KeyError, TypeError, ValueError) as exc:
-                    result = {"status": "FAILED", "tool": name, "reason": f"invalid plan: {exc}"}
+                except (KeyError, TypeError, ValueError, PlanningSchemaError) as exc:
+                    state.planning_validation_failures += 1
+                    state = _repair_plan(arguments, str(exc), state, client, context_manager)
+                    if not state.clarification_needed:
+                        _capture_baseline(state, tools)
+                    log("Task Understanding", state.task_understanding)
+                    log("Acceptance Criteria", [asdict(item) for item in state.acceptance_criteria])
+                    log("Verification Contract", [asdict(item) for item in state.verification_contract])
+                    log("Baseline", state.baseline)
+                    log("Execution Plan", [asdict(item) for item in state.execution_plan])
+                    return state
             else:
                 result = tools.call(state, name, arguments)
             log("PLANNING TOOL RESULT", result)

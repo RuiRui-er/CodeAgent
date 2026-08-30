@@ -78,6 +78,9 @@ class RunResult:
     wrong_location_edits: int | None
     ambiguous_edit_rejections: int
     stale_edit_rejections: int
+    planning_validation_failures: int
+    planning_repair_attempts: int
+    planning_repair_success: bool
     hidden_evaluation: dict[str, Any]
     initial_commit: str
     variant_config: dict[str, Any]
