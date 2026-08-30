@@ -105,7 +105,7 @@ class AgentOrchestrator:
         if event.type == FINISH_REQUESTED:
             state.verification_mode = FINAL
         elif event.type == VERIFICATION_REQUESTED:
-            state.verification_mode = INCREMENTAL
+            state.verification_mode = event.payload.get("mode", INCREMENTAL)
         elif event.type in {FINAL_VERIFIED, FINAL_PARTIAL}:
             state.failed_finish_attempts = 0
             state.finish_guardrail_active = False

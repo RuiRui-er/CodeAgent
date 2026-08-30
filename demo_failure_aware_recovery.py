@@ -36,7 +36,7 @@ def make_state() -> AgentState:
     state.acceptance_criteria = [
         AcceptanceCriterion("AC1", "empty input parses", "CRITICAL", "AUTO", "TARGET", "frozen parser test")
     ]
-    state.execution_plan = [ExecutionStep("STEP1", "fix parser", ["apply_patch", "run_command"], ["AC1"])]
+state.execution_plan = [ExecutionStep("STEP1", "fix parser", "IMPLEMENT", ["apply_patch", "run_command"], ["AC1"])]
     state.current_step = "STEP1"
     return state
 

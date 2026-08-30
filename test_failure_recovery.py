@@ -43,7 +43,7 @@ def state_for_failure() -> AgentState:
     state.acceptance_criteria = [
         AcceptanceCriterion("AC1", "parser works", "CRITICAL", "AUTO", "TARGET", "run parser test")
     ]
-    state.execution_plan = [ExecutionStep("STEP1", "fix parser", ["apply_patch"], ["AC1"])]
+    state.execution_plan = [ExecutionStep("STEP1", "fix parser", "IMPLEMENT", ["apply_patch"], ["AC1"])]
     state.current_step = "STEP1"
     return state
 
@@ -67,6 +67,7 @@ class ReplanClient:
                 "execution_plan": [{
                     "step_id": "REVISED1",
                     "description": "inspect and reset parser state",
+                    "step_kind": "IMPLEMENT",
                     "suggested_tools": ["read_file", "apply_patch"],
                     "related_acceptance_criteria": ["AC1"],
                 }]

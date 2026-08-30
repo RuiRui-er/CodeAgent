@@ -41,6 +41,7 @@ class VerificationCheck:
 class ExecutionStep:
     step_id: str
     description: str
+    step_kind: str
     suggested_tools: list[str]
     related_acceptance_criteria: list[str]
 
@@ -81,6 +82,7 @@ class AgentState:
     planning_validation_failures: int = 0
     planning_repair_attempts: int = 0
     planning_repair_success: bool = False
+    planning_frozen: bool = False
 
     def planning_snapshot(self) -> dict[str, Any]:
         return asdict(self)
@@ -117,6 +119,16 @@ class AgentState:
         except ValueError:
             return
         self.current_step = ids[index + 1] if index + 1 < len(ids) else None
+
+    def current_execution_step(self) -> ExecutionStep | None:
+        return next((step for step in self.execution_plan if step.step_id == self.current_step), None)
+
+    def remaining_execution_steps(self) -> list[ExecutionStep]:
+        completed = set(self.completed_steps)
+        return [step for step in self.execution_plan if step.step_id not in completed and step.step_id != self.current_step]
+
+    def execution_plan_complete(self) -> bool:
+        return bool(self.execution_plan) and self.current_step is None and not self.remaining_execution_steps()
 
     def next_verification_ref(self) -> str:
         self.verification_sequence += 1

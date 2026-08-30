@@ -26,8 +26,8 @@ def main() -> None:
         VerificationCheck("V-1", "Calculator test", "AUTO", "TARGET", "Run unittest", ["python", "-m", "unittest", "-v"], True, ["AC-1"])
     ]
     state.execution_plan = [
-        ExecutionStep("STEP-1", "Inspect divide", ["read_file"], ["AC-1"]),
-        ExecutionStep("STEP-2", "Fix and test divide", ["apply_patch", "run_command"], ["AC-1"]),
+        ExecutionStep("STEP-1", "Inspect divide", "INSPECT", ["read_file"], ["AC-1"]),
+        ExecutionStep("STEP-2", "Fix and test divide", "IMPLEMENT", ["apply_patch", "run_command"], ["AC-1"]),
     ]
     state.current_step = "STEP-1"
 

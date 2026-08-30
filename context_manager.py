@@ -31,8 +31,12 @@ PHASE_SECTION_BUDGETS = {
     },
     EXECUTING: {
         "Task": 2200,
+        "Completed Steps": 2200,
         "Current Step": 2200,
-        "Step Acceptance Criteria": 3000,
+        "Remaining Steps": 3000,
+        "Applied ChangeSets": 3600,
+        "Pending Verification Items": 3800,
+        "Completion Nudge": 900,
         "Relevant Code": 6500,
         "Recent Actions": 2500,
         "Failed Attempts": 1600,
@@ -132,8 +136,12 @@ class ContextManager:
         if state.current_phase == EXECUTING:
             return [
                 ("Task", state.original_task),
+                ("Completed Steps", self._completed_steps(state)),
                 ("Current Step", self._current_step(state)),
-                ("Step Acceptance Criteria", self._step_criteria(state)),
+                ("Remaining Steps", [asdict(item) for item in state.remaining_execution_steps()]),
+                ("Applied ChangeSets", self._applied_changesets(state)),
+                ("Pending Verification Items", self._pending_verification_items(state)),
+                ("Completion Nudge", self._completion_nudge(state)),
                 ("Relevant Code", self._read_relevant_code(state)),
                 ("Recent Actions", state.recent_actions[-RECENT_ACTION_LIMIT:]),
                 ("Failed Attempts", state.failed_attempts),
@@ -214,6 +222,63 @@ class ContextManager:
             return []
         related = set(step.related_acceptance_criteria)
         return [asdict(item) for item in state.acceptance_criteria if item.id in related]
+
+    @staticmethod
+    def _completed_steps(state: AgentState) -> list[dict[str, Any]]:
+        completed = set(state.completed_steps)
+        return [asdict(item) for item in state.execution_plan if item.step_id in completed]
+
+    @staticmethod
+    def _applied_changesets(state: AgentState) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": item.get("id"),
+                "file": item.get("file"),
+                "symbol": item.get("symbol"),
+                "intent": item.get("intent"),
+                "apply_status": item.get("apply_status"),
+                "verification_status": item.get("verification_status"),
+                "related_step": item.get("step_id"),
+            }
+            for item in state.change_sets
+            if item.get("apply_status") == "APPLIED" and item.get("rollback_status") == "NONE"
+        ]
+
+    @staticmethod
+    def _pending_verification_items(state: AgentState) -> list[dict[str, Any]]:
+        results = {
+            item.get("criterion_id"): item.get("status")
+            for item in (state.verification_result or {}).get("criterion_results", [])
+        }
+        pending = []
+        for criterion in state.acceptance_criteria:
+            if results.get(criterion.id) == "PASS":
+                continue
+            checks = [
+                check.id for check in state.verification_contract
+                if criterion.id in check.related_acceptance_criteria
+            ]
+            pending.append({
+                "criterion_id": criterion.id,
+                "description": criterion.description,
+                "status": results.get(criterion.id, "PENDING"),
+                "verification_items": checks,
+            })
+        return pending
+
+    def _completion_nudge(self, state: AgentState) -> str | None:
+        applied = self._applied_changesets(state)
+        pending = self._pending_verification_items(state)
+        if not applied or not pending:
+            return None
+        open_steps = [step for step in [state.current_execution_step(), *state.remaining_execution_steps()] if step]
+        if any(step.step_kind == "IMPLEMENT" for step in open_steps):
+            return None
+        return (
+            "A successful implementation ChangeSet is already applied and the remaining plan contains "
+            "verification work, not an explicit edit. Prefer running the pending target/regression "
+            "checks or call finish to request verification. Do not repeat the same edit."
+        )
 
     def _read_relevant_code(self, state: AgentState) -> list[dict[str, str]]:
         code: list[dict[str, str]] = []

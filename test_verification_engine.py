@@ -4,8 +4,8 @@ import unittest
 import uuid
 from pathlib import Path
 
-from agent_state import DEBUGGING, DONE, EXECUTING, VERIFYING, AcceptanceCriterion, AgentState, VerificationCheck
-from agent_events import FINISH_REQUESTED, AgentEvent
+from agent_state import DEBUGGING, DONE, EXECUTING, VERIFYING, AcceptanceCriterion, AgentState, ExecutionStep, VerificationCheck
+from agent_events import FINISH_REQUESTED, VERIFICATION_REQUESTED, AgentEvent
 from agent_orchestrator import AgentOrchestrator
 from edit_models import PARTIALLY_VERIFIED, REGRESSED, UNVERIFIED, VERIFIED
 from context_manager import ContextManager
@@ -80,6 +80,15 @@ class FinishClient:
         }
 
 
+class CountingNoToolClient:
+    def __init__(self):
+        self.calls = 0
+
+    def complete(self, messages, tool_schemas=None):
+        self.calls += 1
+        return {"role": "assistant", "content": "waiting", "tool_calls": []}
+
+
 def criterion(identifier, criticality, mode, evidence):
     return AcceptanceCriterion(identifier, identifier, criticality, mode, evidence, f"verify {identifier}")
 
@@ -101,6 +110,71 @@ def make_state(criteria, checks, baseline=None):
 
 
 class VerificationEngineTests(unittest.TestCase):
+    @staticmethod
+    def completed_plan(state):
+        state.execution_plan = [ExecutionStep("S1", "implement fix", "IMPLEMENT", [], ["AC_TARGET"])]
+        state.completed_steps = ["S1"]
+        state.current_step = None
+        state.set_phase(EXECUTING)
+
+    def test_completed_plan_automatically_runs_final_verification_before_model(self):
+        criteria = [criterion("AC_TARGET", "CRITICAL", "AUTO", "TARGET")]
+        tools = FakeTools({"target": [observation(True)]})
+        state = make_state(criteria, [check("target", "TARGET", "AC_TARGET")])
+        self.completed_plan(state)
+        client = CountingNoToolClient()
+
+        run_execution(state, tools, client, max_steps=1)
+
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(state.current_phase, DONE)
+        self.assertEqual(state.verification_result["overall_status"], VERIFIED)
+        self.assertTrue(any(item["event"] == VERIFICATION_REQUESTED for item in state.phase_history))
+        self.assertEqual(state.verification_mode, "FINAL")
+
+    def test_partial_plan_does_not_automatically_request_final_verification(self):
+        criteria = [criterion("AC_TARGET", "CRITICAL", "AUTO", "TARGET")]
+        tools = FakeTools({"target": [observation(True)]})
+        state = make_state(criteria, [check("target", "TARGET", "AC_TARGET")])
+        state.execution_plan = [ExecutionStep("S1", "implement fix", "IMPLEMENT", [], ["AC_TARGET"])]
+        state.current_step = "S1"
+        state.set_phase(EXECUTING)
+        client = CountingNoToolClient()
+
+        run_execution(state, tools, client, max_steps=1)
+
+        self.assertEqual(client.calls, 1)
+        self.assertFalse(any(item["event"] == VERIFICATION_REQUESTED for item in state.phase_history))
+        self.assertIsNone(state.verification_result)
+
+    def test_automatic_final_verification_cannot_make_unverified_done(self):
+        criteria = [criterion("AC_TARGET", "CRITICAL", "AUTO", "TARGET")]
+        tools = FakeTools({"target": [observation(False)]})
+        state = make_state(criteria, [check("target", "TARGET", "AC_TARGET")])
+        self.completed_plan(state)
+
+        run_execution(state, tools, CountingNoToolClient(), max_steps=1)
+
+        self.assertEqual(state.verification_result["overall_status"], UNVERIFIED)
+        self.assertFalse(any(item["to"] == DONE for item in state.phase_history))
+
+    def test_automatic_final_verification_cannot_make_regressed_done(self):
+        criteria = [
+            criterion("AC_TARGET", "CRITICAL", "AUTO", "TARGET"),
+            criterion("AC_REG", "NON_CRITICAL", "AUTO", "REGRESSION"),
+        ]
+        checks = [check("target", "TARGET", "AC_TARGET"), check("regression", "REGRESSION", "AC_REG", True)]
+        baseline = [{"verification_id": "regression", "observation": observation(True)}]
+        tools = FakeTools({"target": [observation(True)], "regression": [observation(False, "FAILED tests/test_new.py::test_new")]})
+        state = make_state(criteria, checks, baseline)
+        self.completed_plan(state)
+
+        run_execution(state, tools, CountingNoToolClient(), max_steps=1)
+
+        self.assertEqual(state.verification_result["overall_status"], REGRESSED)
+        self.assertTrue(any(item["to"] == DEBUGGING for item in state.phase_history))
+        self.assertFalse(any(item["to"] == DONE for item in state.phase_history))
+
     def test_finish_request_cannot_bypass_failed_critical_evidence(self):
         directory = Path(__file__).parent / ".test_workspaces" / f"finish_{uuid.uuid4().hex}"
         directory.mkdir(parents=True)

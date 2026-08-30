@@ -3,7 +3,9 @@ import json
 import unittest
 from pathlib import Path
 
-from coding_agent import WorkspaceTools, run_planning
+from coding_agent import WorkspaceTools, _repair_plan, run_planning
+from context_manager import ContextManager
+from planning_schema import PlanningSchemaError
 
 
 def valid_plan():
@@ -24,6 +26,7 @@ def valid_plan():
         }],
         "execution_plan": [{
             "step_id": "STEP-1", "description": "Correct the operand order, then run V-1.",
+            "step_kind": "IMPLEMENT",
             "suggested_tools": ["read_file", "apply_patch", "run_command"],
             "related_acceptance_criteria": ["AC-1"],
         }],
@@ -86,6 +89,7 @@ class FakePlanningClient:
                             "execution_plan": [{
                                 "step_id": "STEP-1",
                                 "description": "Correct the operand order, then run V-1.",
+                                "step_kind": "IMPLEMENT",
                                 "suggested_tools": ["read_file", "apply_patch", "run_command"],
                                 "related_acceptance_criteria": ["AC-1"],
                             }],
@@ -138,6 +142,84 @@ class PlanningTests(unittest.TestCase):
         self.assertIn("$.verification_contract[0].verification_method: missing required field", client.messages[1][-1]["content"])
         self.assertIn("do not change the meaning or IDs", client.messages[1][-1]["content"])
 
+    def test_invalid_criterion_verification_method_can_be_repaired_without_semantic_drift(self):
+        invalid = valid_plan()
+        invalid["acceptance_criteria"][0]["verification_method"] = "verify feature works"
+        repaired = valid_plan()
+        original_core = {
+            field: invalid["acceptance_criteria"][0][field]
+            for field in ("id", "description", "criticality", "verification_mode", "evidence_type")
+        }
+        client = SequenceClient([submit_response(invalid), submit_response(repaired, "repair-method")])
+
+        state = run_planning("Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1)
+
+        criterion = state.acceptance_criteria[0]
+        self.assertEqual(criterion.verification_method, repaired["acceptance_criteria"][0]["verification_method"])
+        self.assertEqual(
+            {field: getattr(criterion, field) for field in original_core},
+            original_core,
+        )
+        self.assertTrue(state.planning_frozen)
+
+    def test_two_invalid_fields_can_be_repaired_in_one_response(self):
+        invalid = valid_plan()
+        invalid["acceptance_criteria"][0]["verification_method"] = "verify feature works"
+        del invalid["verification_contract"][0]["verification_method"]
+        repaired = valid_plan()
+        client = SequenceClient([submit_response(invalid), submit_response(repaired, "repair-two")])
+
+        state = run_planning("Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1)
+
+        repair_prompt = client.messages[1][-1]["content"]
+        self.assertIn("$.acceptance_criteria[0].verification_method", repair_prompt)
+        self.assertIn("$.verification_contract[0].verification_method", repair_prompt)
+        self.assertTrue(state.planning_repair_success)
+        self.assertTrue(state.planning_frozen)
+
+    def test_multi_field_repair_still_rejects_third_legal_field_change(self):
+        invalid = valid_plan()
+        invalid["acceptance_criteria"][0]["verification_method"] = "verify feature works"
+        del invalid["verification_contract"][0]["verification_method"]
+        drifted = valid_plan()
+        drifted["execution_plan"][0]["description"] = "Unrelated rewritten step"
+        client = SequenceClient([
+            submit_response(invalid),
+            submit_response(drifted, "repair-extra-1"),
+            submit_response(drifted, "repair-extra-2"),
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "outside"):
+            run_planning("Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1)
+
+    def test_repair_rejects_unrelated_core_semantic_change(self):
+        invalid = valid_plan()
+        invalid["acceptance_criteria"][0]["verification_method"] = "verify feature works"
+        drifted = valid_plan()
+        drifted["acceptance_criteria"][0]["description"] = "Different behavior"
+        client = SequenceClient([
+            submit_response(invalid),
+            submit_response(drifted, "repair-drift-1"),
+            submit_response(drifted, "repair-drift-2"),
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "protected core semantics"):
+            run_planning("Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1)
+
+    def test_frozen_plan_cannot_enter_repair_again(self):
+        client = SequenceClient([submit_response(valid_plan())])
+        root = Path(__file__).parent / "demo_project"
+        state = run_planning("Fix divide", WorkspaceTools(root), client, 1)
+
+        with self.assertRaisesRegex(PlanningSchemaError, "already frozen"):
+            _repair_plan(
+                valid_plan(),
+                "$.acceptance_criteria[0].verification_method: invalid",
+                state,
+                SequenceClient([]),
+                ContextManager(root),
+            )
+
     def test_two_invalid_repairs_end_planning(self):
         invalid = valid_plan()
         del invalid["verification_contract"][0]["verification_method"]
@@ -150,6 +232,40 @@ class PlanningTests(unittest.TestCase):
             run_planning("Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1)
         self.assertEqual(len(client.messages), 3)
 
+    def test_last_planning_turn_requires_plan_submission(self):
+        explore = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": "inspect", "type": "function",
+                "function": {"name": "read_file", "arguments": json.dumps({"path": "calculator.py"})},
+            }],
+        }
+        client = SequenceClient([explore, submit_response(valid_plan())])
+        state = run_planning(
+            "Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 2
+        )
+        self.assertEqual(state.current_step, "STEP-1")
+        self.assertIn("read_file", client.tool_names[0])
+        self.assertEqual(client.tool_names[1], ["submit_plan"])
+        self.assertIn("final PLANNING turn", client.messages[1][0]["content"])
+
+    def test_repeated_reads_get_nudge_without_losing_read_tools(self):
+        read = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": "read", "type": "function",
+                "function": {"name": "read_file", "arguments": json.dumps({"path": "calculator.py"})},
+            }],
+        }
+        client = SequenceClient([read, read, read, submit_response(valid_plan())])
+        state = run_planning(
+            "Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 5
+        )
+        self.assertEqual(state.current_step, "STEP-1")
+        self.assertIn("did not add a new relevant file", client.messages[3][0]["content"])
+        self.assertIn("read_file", client.tool_names[3])
+        self.assertIn("submit_plan", client.tool_names[3])
+
 
 class SequenceClient:
     def __init__(self, responses):
@@ -158,6 +274,8 @@ class SequenceClient:
 
     def complete(self, messages, tool_schemas=None):
         self.messages.append(messages)
+        self.tool_names = getattr(self, "tool_names", [])
+        self.tool_names.append([schema["function"]["name"] for schema in tool_schemas])
         return next(self.responses)
 
 

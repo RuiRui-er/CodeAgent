@@ -40,6 +40,7 @@ from agent_events import (
     TARGET_FAILED,
     TOOL_FAILED,
     VERIFICATION_REGRESSED,
+    VERIFICATION_REQUESTED,
     VERIFICATION_UNVERIFIED,
     AgentEvent,
 )
@@ -54,7 +55,7 @@ from planning_schema import (
     MAX_PLANNING_REPAIR_ATTEMPTS,
     PlanningSchemaError,
     build_repair_instruction,
-    validate_acceptance_criteria_preserved,
+    validate_repair_scope,
     validate_schema,
 )
 
@@ -86,10 +87,28 @@ mark checks that should be run now as baseline_required. Prefer existing tests, 
 minimal reproduction or input/output check, then build/compile and runtime sanity.
 If a missing target check needs a new file, put creation and its pre-fix run before
 product-code changes in the execution plan. Tie every plan step to criterion IDs.
+Classify every execution step explicitly as INSPECT, IMPLEMENT, or VERIFY. The
+step_kind describes semantics; suggested_tools are recommendations only.
 Freeze target cases, expected behavior, and commands now; they must not be regenerated
 after implementation. Prefer cheap sanity evidence before target and regression checks.
 Do not propose multiple agents, RAG, or UI.
 """
+
+PLANNING_FINALIZATION_PROMPT = """
+This is the final PLANNING turn. Stop exploring: use the evidence already present in
+the structured planning context and call submit_plan now. Do not call read-only tools
+again and do not return a prose-only answer. If the task is genuinely ambiguous, set
+clarification_needed in submit_plan instead of continuing exploration.
+"""
+
+PLANNING_CONVERGENCE_PROMPT = """
+Recent read/search turns did not add a new relevant file, symbol, or planning finding.
+Before exploring again, state the specific critical information still missing. If no
+critical gap remains, call submit_plan now. Read-only tools remain available when a
+concrete unresolved gap justifies them.
+"""
+
+PLANNING_STAGNATION_NUDGE_AFTER = 2
 
 
 SUBMIT_PLAN_SCHEMA = {
@@ -145,10 +164,11 @@ SUBMIT_PLAN_SCHEMA = {
                         "properties": {
                             "step_id": {"type": "string"},
                             "description": {"type": "string"},
+                            "step_kind": {"type": "string", "enum": ["INSPECT", "IMPLEMENT", "VERIFY"]},
                             "suggested_tools": {"type": "array", "items": {"type": "string"}},
                             "related_acceptance_criteria": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                         },
-                        "required": ["step_id", "description", "suggested_tools", "related_acceptance_criteria"],
+                        "required": ["step_id", "description", "step_kind", "suggested_tools", "related_acceptance_criteria"],
                         "additionalProperties": False,
                     },
                 },
@@ -270,7 +290,42 @@ def _parse_tool_arguments(tool_call: dict[str, Any]) -> tuple[dict[str, Any], st
 
 
 def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
-    validate_schema(payload, SUBMIT_PLAN_SCHEMA["function"]["parameters"])
+    if state.planning_frozen:
+        raise PlanningSchemaError("$: planning output is already frozen")
+    validation_errors: list[str] = []
+    try:
+        validate_schema(payload, SUBMIT_PLAN_SCHEMA["function"]["parameters"])
+    except PlanningSchemaError as exc:
+        validation_errors.extend(exc.errors)
+    raw_criteria = payload.get("acceptance_criteria", [])
+    if isinstance(raw_criteria, list):
+        for index, item in enumerate(raw_criteria):
+            if not isinstance(item, dict):
+                continue
+            method = item.get("verification_method")
+            if isinstance(method, str) and not _specific_verification_method(method):
+                validation_errors.append(
+                    f"$.acceptance_criteria[{index}].verification_method: must name a concrete command, test, "
+                    "input/output check, or manual procedure and required result"
+                )
+    raw_checks = payload.get("verification_contract", [])
+    if isinstance(raw_checks, list):
+        for index, item in enumerate(raw_checks):
+            if not isinstance(item, dict):
+                continue
+            method = item.get("verification_method")
+            if isinstance(method, str) and not _specific_verification_method(method):
+                validation_errors.append(
+                    f"$.verification_contract[{index}].verification_method: must name a concrete command, test, "
+                    "input/output check, or manual procedure and required result"
+                )
+            if item.get("verification_mode") == "AUTO" and item.get("command") in (None, []):
+                validation_errors.append(
+                    f"$.verification_contract[{index}].command: AUTO verification requires a non-empty command"
+                )
+    if validation_errors:
+        raise PlanningSchemaError(list(dict.fromkeys(validation_errors)))
+
     criteria = [AcceptanceCriterion(**item) for item in payload["acceptance_criteria"]]
     checks = [VerificationCheck(**item) for item in payload["verification_contract"]]
     steps = [ExecutionStep(**item) for item in payload["execution_plan"]]
@@ -283,18 +338,10 @@ def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
     step_ids = [item.step_id for item in steps]
     if len(step_ids) != len(set(step_ids)):
         raise ValueError("execution step IDs must be unique")
-    for item in [*criteria, *checks]:
-        if not _specific_verification_method(item.verification_method):
-            raise ValueError(
-                f"verification_method for {item.id} must name a concrete command, test, "
-                "input/output check, or manual procedure and required result"
-            )
     known = set(criterion_ids)
     for check in checks:
         if not set(check.related_acceptance_criteria) <= known:
             raise ValueError(f"verification check {check.id} refers to an unknown criterion")
-        if check.verification_mode == "AUTO" and not check.command:
-            raise ValueError(f"AUTO verification check {check.id} needs a command")
     for step in steps:
         if not set(step.related_acceptance_criteria) <= known:
             raise ValueError(f"execution step {step.step_id} refers to an unknown criterion")
@@ -318,6 +365,7 @@ def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
     state.execution_plan = steps
     state.current_step = steps[0].step_id
     state.clarification_needed = payload.get("clarification_needed")
+    state.planning_frozen = True
     return state
 
 
@@ -336,11 +384,17 @@ def _repair_plan(
     client: OpenAICompatibleClient,
     context_manager: ContextManager,
 ) -> AgentState:
+    if state.planning_frozen:
+        raise PlanningSchemaError("$: planning output is already frozen; repair is not allowed")
     current_payload = payload
     current_error = validation_error
+    repair_rejection: str | None = None
     for attempt in range(1, MAX_PLANNING_REPAIR_ATTEMPTS + 1):
         state.planning_repair_attempts += 1
-        prompt = build_repair_instruction(current_payload, current_error, attempt)
+        prompt_error = current_error
+        if repair_rejection:
+            prompt_error += f"\nPrevious repair rejection (not an allowed path): {repair_rejection}"
+        prompt = build_repair_instruction(current_payload, prompt_error, attempt)
         messages = context_manager.build_messages(state, PLANNING_PROMPT)
         messages.append({"role": "user", "content": prompt})
         log(f"PLANNING SCHEMA REPAIR {attempt}/{MAX_PLANNING_REPAIR_ATTEMPTS}", current_error)
@@ -361,18 +415,24 @@ def _repair_plan(
             current_payload = repaired
             continue
         try:
-            validate_acceptance_criteria_preserved(payload, repaired)
+            validate_repair_scope(current_payload, repaired, current_error)
+        except PlanningSchemaError as exc:
+            repair_rejection = str(exc)
+            state.planning_validation_failures += 1
+            continue
+        try:
             repaired_state = _validate_plan(repaired, state)
         except (KeyError, TypeError, ValueError, PlanningSchemaError) as exc:
             current_error = str(exc)
             current_payload = repaired
+            repair_rejection = None
             state.planning_validation_failures += 1
             continue
         state.planning_repair_success = True
         return repaired_state
     raise RuntimeError(
         f"PLANNING schema repair failed after {MAX_PLANNING_REPAIR_ATTEMPTS} attempts; "
-        f"last validation error: {current_error}"
+        f"last validation error: {repair_rejection or current_error}"
     )
 
 
@@ -453,17 +513,32 @@ def _record_tool_event(
     succeeded = result.get("status") in {"SUCCESS", "APPLIED"}
     if name == "read_file" and succeeded:
         state.add_relevant_file(str(arguments.get("path", "")))
+        step = state.current_execution_step()
+        if state.current_phase == EXECUTING and step and step.step_kind == "INSPECT":
+            state.complete_current_step()
     elif name == "search_code" and succeeded:
         state.add_relevant_symbol(str(arguments.get("query", "")))
         for match in result.get("matches", []):
             state.add_relevant_file(str(match.get("path", "")))
+        step = state.current_execution_step()
+        if state.current_phase == EXECUTING and step and step.step_kind == "INSPECT":
+            state.complete_current_step()
     elif name in {"apply_patch", "write_file"} and succeeded:
         path = str(result.get("file", result.get("path", arguments.get("file", arguments.get("path", "")))))
         state.add_relevant_file(path)
         if result.get("symbol"):
             state.add_relevant_symbol(str(result["symbol"]))
-    elif name == "finish" and succeeded:
-        state.complete_current_step()
+        step = state.current_execution_step()
+        if step and step.step_kind == "IMPLEMENT":
+            state.complete_current_step()
+    elif name == "run_command" and succeeded and state.current_phase == EXECUTING:
+        step = state.current_execution_step()
+        if step and step.step_kind == "VERIFY":
+            state.complete_current_step()
+    elif name == "list_dir" and succeeded and state.current_phase == EXECUTING:
+        step = state.current_execution_step()
+        if step and step.step_kind == "INSPECT":
+            state.complete_current_step()
 
     if allow_phase_changes and failure_recovery:
         return failure_recovery.handle_tool_result(state, name, arguments, result)
@@ -535,6 +610,28 @@ def _capture_baseline(state: AgentState, tools: WorkspaceTools) -> None:
         observation = tools.call(state, "run_command", {"command": check.command})
         state.baseline.append({"verification_id": check.id, "observation": observation})
         log("BASELINE RESULT", state.baseline[-1])
+    _complete_successful_baseline_steps(state)
+
+
+def _complete_successful_baseline_steps(state: AgentState) -> None:
+    successful_ids = {
+        item["verification_id"]
+        for item in state.baseline
+        if item.get("observation", {}).get("status") == "SUCCESS"
+    }
+    covered_criteria = {
+        criterion
+        for check in state.verification_contract
+        if check.id in successful_ids
+        for criterion in check.related_acceptance_criteria
+    }
+    while True:
+        step = state.current_execution_step()
+        if not step or step.step_kind != "VERIFY":
+            return
+        if not set(step.related_acceptance_criteria) <= covered_criteria:
+            return
+        state.complete_current_step()
 
 
 def run_planning(
@@ -548,19 +645,37 @@ def run_planning(
     context_manager = ContextManager(tools.root)
     trajectory: list[dict[str, Any]] = []
     planning_tools = tool_schemas_for_phase(PLANNING) + [SUBMIT_PLAN_SCHEMA]
+    stagnant_exploration_turns = 0
     for step in range(1, max_planning_steps + 1):
-        messages = context_manager.build_messages(state, PLANNING_PROMPT)
+        finalizing = step == max_planning_steps
+        converging = stagnant_exploration_turns >= PLANNING_STAGNATION_NUDGE_AFTER
+        prompt = PLANNING_PROMPT
+        if converging and not finalizing:
+            prompt += PLANNING_CONVERGENCE_PROMPT
+        if finalizing:
+            prompt += PLANNING_FINALIZATION_PROMPT
+        available_tools = [SUBMIT_PLAN_SCHEMA] if finalizing else planning_tools
+        messages = context_manager.build_messages(state, prompt)
         log(f"PLANNING STEP {step}/{max_planning_steps}", {"trajectory_events": len(trajectory)})
-        message = client.complete(messages, planning_tools)
+        message = client.complete(messages, available_tools)
         trajectory.append({"assistant": message})
         if message.get("content"):
             log("PLANNING MESSAGE", message["content"])
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
             state.add_action({"model_message": message.get("content") or "No tool call returned."})
+            stagnant_exploration_turns = 0
             continue
+        knowledge_before = (
+            frozenset(state.relevant_files),
+            frozenset(state.relevant_symbols),
+            len(state.confirmed_facts),
+        )
+        exploration_only = True
         for tool_call in tool_calls:
             name = tool_call.get("function", {}).get("name", "")
+            if name not in {"read_file", "search_code"}:
+                exploration_only = False
             arguments, parse_error = _parse_tool_arguments(tool_call)
             log("PLANNING TOOL CALL", {"name": name, "arguments": arguments})
             if parse_error:
@@ -591,6 +706,15 @@ def run_planning(
                 result = tools.call(state, name, arguments)
             log("PLANNING TOOL RESULT", result)
             _record_tool_event(state, name, arguments, result, trajectory, allow_phase_changes=False)
+        knowledge_after = (
+            frozenset(state.relevant_files),
+            frozenset(state.relevant_symbols),
+            len(state.confirmed_facts),
+        )
+        if exploration_only and knowledge_after == knowledge_before:
+            stagnant_exploration_turns += 1
+        else:
+            stagnant_exploration_turns = 0
     raise RuntimeError(f"PLANNING did not produce a valid plan in {max_planning_steps} steps")
 
 
@@ -625,6 +749,14 @@ files as the only source of truth for current code.
             return final
         if state.current_phase == PLANNING:
             run_replanning(state, tools, client, context_manager, orchestrator)
+        if state.current_phase == EXECUTING and state.execution_plan_complete():
+            final = _request_final_verification(
+                state, verification_engine, orchestrator,
+                AgentEvent(VERIFICATION_REQUESTED, "execution plan completed", {"mode": "FINAL"}),
+            )
+            if final is not None:
+                return final
+            continue
         messages = context_manager.build_messages(state, execution_prompt)
         log(f"STEP {step}/{max_steps} - MODEL REQUEST", {"trajectory_events": len(trajectory)})
         message = client.complete(messages, tool_schemas_for_phase(state.current_phase))
@@ -659,17 +791,11 @@ files as the only source of truth for current code.
                 allow_phase_changes=True, failure_recovery=failure_recovery,
             )
             if name == "finish" and result.get("status") == "SUCCESS":
-                orchestrator.transition(state, AgentEvent(FINISH_REQUESTED, "model requested final verification"))
-                verification = verification_engine.run_final_verification(state)
-                log("FINAL VERIFICATION", verification)
-                transition = _transition_verification(state, verification, orchestrator)
-                if transition.next_phase == DONE:
-                    final = _verification_report(verification)
-                    log("AGENT DONE", final)
-                    return final
-                if transition.pause_autonomous_loop:
-                    final = _verification_report(verification)
-                    log("HUMAN CONFIRMATION REQUIRED", final)
+                final = _request_final_verification(
+                    state, verification_engine, orchestrator,
+                    AgentEvent(FINISH_REQUESTED, "model requested final verification"),
+                )
+                if final is not None:
                     return final
                 # A failed finish starts a fresh DEBUGGING decision; ignore any
                 # additional tool calls bundled with the finish request.
@@ -677,11 +803,40 @@ files as the only source of truth for current code.
             transition = _transition_tool_result(state, name, result, failure, orchestrator)
             if transition and transition.next_phase == PLANNING:
                 break
+            if state.current_phase == EXECUTING and state.execution_plan_complete():
+                final = _request_final_verification(
+                    state, verification_engine, orchestrator,
+                    AgentEvent(VERIFICATION_REQUESTED, "execution plan completed", {"mode": "FINAL"}),
+                )
+                if final is not None:
+                    return final
+                break
 
     orchestrator.transition(state, AgentEvent(MAX_STEPS_REACHED, f"maximum of {max_steps} model steps reached"))
     final = _termination_summary(state, max_steps)
     log("AGENT STOPPED", final)
     return final
+
+
+def _request_final_verification(
+    state: AgentState,
+    verification_engine: VerificationEngine,
+    orchestrator: AgentOrchestrator,
+    event: AgentEvent,
+) -> str | None:
+    orchestrator.transition(state, event)
+    verification = verification_engine.run_final_verification(state)
+    log("FINAL VERIFICATION", verification)
+    transition = _transition_verification(state, verification, orchestrator)
+    if transition.next_phase == DONE:
+        final = _verification_report(verification)
+        log("AGENT DONE", final)
+        return final
+    if transition.pause_autonomous_loop:
+        final = _verification_report(verification)
+        log("HUMAN CONFIRMATION REQUIRED", final)
+        return final
+    return None
 
 
 def _transition_tool_result(
