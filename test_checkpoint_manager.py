@@ -126,6 +126,58 @@ class CheckpointManagerTests(unittest.TestCase):
         self.assertFalse(tools.checkpoint_manager.checkpoint_available)
         self.assertIn("dirty", tools.checkpoint_manager.unavailable_reason)
 
+    def _verified_pending_change(self):
+        tools = ToolExecutor(self.root)
+        state = AgentState("generated artifacts", current_phase=EXECUTING)
+        applied = self._apply(tools, state, "return 1", "return 2", "verified change")
+        tools.checkpoint_manager.update_change_verification(state, applied["change_set"]["id"], VERIFIED)
+        return tools, state
+
+    def test_python_cache_and_pyc_do_not_block_stable_checkpoint(self):
+        tools, state = self._verified_pending_change()
+        cache = self.root / "__pycache__"
+        cache.mkdir()
+        (cache / "app.cpython-312.pyc").write_bytes(b"reproducible")
+        (self.root / "standalone.pyc").write_bytes(b"reproducible")
+
+        result = tools.checkpoint_manager.mark_stable(state, "verified with runtime cache")
+
+        self.assertEqual(result["status"], "CREATED")
+        self.assertNotIn("__pycache__/app.cpython-312.pyc", self._git("ls-files"))
+        self.assertNotIn("standalone.pyc", self._git("ls-files"))
+        self.assertEqual(tools.checkpoint_manager.pending_changesets, [])
+
+    def test_pytest_cache_does_not_block_stable_checkpoint(self):
+        tools, state = self._verified_pending_change()
+        cache = self.root / ".pytest_cache" / "v" / "cache"
+        cache.mkdir(parents=True)
+        (cache / "nodeids").write_text("[]", encoding="utf-8")
+
+        result = tools.checkpoint_manager.mark_stable(state, "verified with pytest cache")
+
+        self.assertEqual(result["status"], "CREATED")
+        self.assertNotIn(".pytest_cache/v/cache/nodeids", self._git("ls-files"))
+
+    def test_unknown_source_and_text_files_still_block_stable_checkpoint(self):
+        tools, state = self._verified_pending_change()
+        (self.root / "unknown.py").write_text("value = 3\n", encoding="utf-8")
+        (self.root / "notes.txt").write_text("unknown\n", encoding="utf-8")
+
+        result = tools.checkpoint_manager.mark_stable(state, "must remain guarded")
+
+        self.assertEqual(result["status"], UNEXPECTED_WORKSPACE_CHANGE)
+        self.assertEqual(result["unknown_paths"], ["notes.txt", "unknown.py"])
+
+    def test_generated_artifacts_do_not_block_rollback_safety(self):
+        tools, state = self._verified_pending_change()
+        cache = self.root / "__pycache__"
+        cache.mkdir()
+        (cache / "app.cpython-312.pyc").write_bytes(b"reproducible")
+
+        result = tools.checkpoint_manager.rollback_last_stable(state, "recover")
+
+        self.assertEqual(result["status"], "ROLLED_BACK")
+
 
 if __name__ == "__main__":
     unittest.main()

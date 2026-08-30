@@ -55,7 +55,7 @@ class CheckpointManager:
         repo_root = Path(top_level.stdout.strip()).resolve()
         if repo_root != self.workspace:
             return self._unavailable("target workspace is not the Git repository root")
-        status = self._status_paths()
+        status = self._actionable_status_paths()
         if status:
             return self._unavailable("Stable checkpoint initialization refused: working tree is dirty", WORKSPACE_DIRTY)
         head = self._head()
@@ -292,7 +292,21 @@ class CheckpointManager:
 
     def _unknown_workspace_changes(self) -> list[str]:
         known = self._known_pending_files()
-        return sorted(path for path in self._status_paths() if path not in known)
+        return sorted(path for path in self._actionable_status_paths() if path not in known)
+
+    def _actionable_status_paths(self) -> set[str]:
+        return {path for path in self._status_paths() if not self._is_known_generated_artifact(path)}
+
+    @staticmethod
+    def _is_known_generated_artifact(path: str) -> bool:
+        """Recognize only narrow, reproducible Python runtime artifacts."""
+        normalized = path.replace("\\", "/").strip("/")
+        parts = normalized.split("/") if normalized else []
+        return (
+            "__pycache__" in parts
+            or ".pytest_cache" in parts
+            or normalized.lower().endswith(".pyc")
+        )
 
     def _status_paths(self) -> set[str]:
         status = self._git(["-c", "core.quotepath=false", "status", "--porcelain", "--untracked-files=all"], check=False)
