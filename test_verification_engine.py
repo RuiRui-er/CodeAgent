@@ -223,12 +223,61 @@ class VerificationEngineTests(unittest.TestCase):
         state = make_state(criteria, checks)
 
         result = VerificationEngine(tools).run_final_verification(state)
-        _transition_verification(state, result, AgentOrchestrator())
+        transition = _transition_verification(state, result, AgentOrchestrator())
 
         self.assertEqual(result["overall_status"], PARTIALLY_VERIFIED)
         self.assertEqual(result["manual_items"], ["AC_DOC"])
-        self.assertEqual(state.current_phase, DONE)
+        self.assertEqual(state.current_phase, VERIFYING)
+        self.assertTrue(transition.needs_user_confirmation)
+        self.assertEqual(tools.checkpoint_manager.stable_calls, 0)
+
+    def test_human_evidence_reaggregates_cached_auto_results_without_rerun(self):
+        criteria = [
+            criterion("AC_AUTO", "CRITICAL", "AUTO", "TARGET"),
+            criterion("AC_HUMAN", "CRITICAL", "HUMAN", "TARGET"),
+        ]
+        checks = [check("auto", "TARGET", "AC_AUTO"), check("human", "TARGET", "AC_HUMAN", mode="HUMAN")]
+        tools = FakeTools({"auto": [observation(True)]})
+        state = make_state(criteria, checks)
+        engine = VerificationEngine(tools)
+        first = engine.run_final_verification(state)
+        orchestrator = AgentOrchestrator()
+        first_transition = _transition_verification(state, first, orchestrator)
+        auto_call_count = len(tools.calls)
+
+        self.assertEqual(first["overall_status"], UNVERIFIED)
+        self.assertTrue(first_transition.needs_user_confirmation)
+        accepted = engine.submit_human_evidence(state, [{
+            "criterion_id": "AC_HUMAN", "accepted": True, "evidence": "User inspected the rendered output and accepted it.",
+        }])
+        final_transition = _transition_verification(state, accepted, orchestrator)
+
+        self.assertEqual(len(tools.calls), auto_call_count)
+        self.assertEqual(accepted["overall_status"], VERIFIED)
+        human_result = next(item for item in accepted["criterion_results"] if item["criterion_id"] == "AC_HUMAN")
+        self.assertEqual(human_result["evidence_source"], "HUMAN")
+        self.assertEqual(final_transition.next_phase, DONE)
+        self.assertFalse(state.needs_user_confirmation)
         self.assertEqual(tools.checkpoint_manager.stable_calls, 1)
+
+    def test_rejected_human_evidence_cannot_done(self):
+        criteria = [criterion("AC_HUMAN", "CRITICAL", "HUMAN", "TARGET")]
+        checks = [check("human", "TARGET", "AC_HUMAN", mode="HUMAN")]
+        tools = FakeTools({})
+        state = make_state(criteria, checks)
+        engine = VerificationEngine(tools)
+        first = engine.run_final_verification(state)
+        orchestrator = AgentOrchestrator()
+        _transition_verification(state, first, orchestrator)
+
+        rejected = engine.submit_human_evidence(state, [{
+            "criterion_id": "AC_HUMAN", "accepted": False, "evidence": "User observed incorrect output.",
+        }])
+        transition = _transition_verification(state, rejected, orchestrator)
+
+        self.assertEqual(rejected["overall_status"], UNVERIFIED)
+        self.assertNotEqual(transition.next_phase, DONE)
+        self.assertEqual(tools.checkpoint_manager.stable_calls, 0)
 
     def test_target_pass_with_new_regression_recovers_and_debugs(self):
         criteria = [

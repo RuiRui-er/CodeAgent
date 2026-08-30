@@ -69,9 +69,8 @@ class AgentOrchestratorTests(unittest.TestCase):
         self.assertEqual(transition.next_phase, VERIFYING)
         self.assertTrue(transition.pause_autonomous_loop)
         self.assertTrue(unverified.needs_user_confirmation)
-        resumed = self.orchestrator.transition(unverified, AgentEvent(USER_CONFIRMED, "user supplied confirmation"))
-        self.assertFalse(resumed.needs_user_confirmation)
-        self.assertEqual(resumed.next_phase, VERIFYING)
+        with self.assertRaisesRegex(ValueError, "illegal transition"):
+            self.orchestrator.transition(unverified, AgentEvent(USER_CONFIRMED, "confirmation without evidence"))
 
     def test_repeated_failure_replans_and_final_partial_can_done(self):
         state = self.state(EXECUTING)
@@ -84,7 +83,8 @@ class AgentOrchestratorTests(unittest.TestCase):
         partial = self.state(VERIFYING)
         partial.manual_confirmation_items = ["AC_DOC"]
         self.orchestrator.transition(partial, AgentEvent(FINAL_PARTIAL, "only non-critical human item remains"))
-        self.assertEqual(partial.current_phase, DONE)
+        self.assertEqual(partial.current_phase, VERIFYING)
+        self.assertTrue(partial.needs_user_confirmation)
         self.assertEqual(partial.manual_confirmation_items, ["AC_DOC"])
 
     def test_illegal_transitions_and_global_max_steps(self):

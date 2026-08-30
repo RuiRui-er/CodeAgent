@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Any, Iterable
 
 from agent_state import AgentState, VerificationCheck
 from edit_models import PARTIALLY_VERIFIED, REGRESSED, UNVERIFIED, VERIFIED
-from verification_models import CRITERION_UNVERIFIED, FAIL, PASS, CriterionResult, VerificationResult
+from verification_models import CRITERION_UNVERIFIED, FAIL, PASS, CriterionResult, HumanEvidence, VerificationResult
 
 
 FINAL = "FINAL"
@@ -35,6 +36,94 @@ class VerificationEngine:
         selected = set(criterion_ids or self._current_step_criteria(state))
         result = self._run(state, INCREMENTAL, selected)
         return self._apply_gate(state, result, final=False)
+
+    def submit_human_evidence(
+        self,
+        state: AgentState,
+        confirmations: Iterable[dict[str, Any] | HumanEvidence],
+    ) -> dict[str, Any]:
+        """Bind explicit HUMAN evidence and re-aggregate without rerunning AUTO checks."""
+        if not state.verification_result:
+            raise ValueError("human evidence requires an existing verification result")
+        human_criteria = {
+            item.id: item for item in state.acceptance_criteria if item.verification_mode == "HUMAN"
+        }
+        submitted: list[HumanEvidence] = []
+        for item in confirmations:
+            evidence = item if isinstance(item, HumanEvidence) else HumanEvidence(**item)
+            if evidence.criterion_id not in human_criteria:
+                raise ValueError(f"{evidence.criterion_id} is not a HUMAN Acceptance Criterion")
+            if not evidence.evidence.strip():
+                raise ValueError(f"{evidence.criterion_id} human evidence must be non-empty")
+            submitted.append(evidence)
+        by_id = {item["criterion_id"]: item for item in state.human_evidence}
+        by_id.update({item.criterion_id: item.to_dict() for item in submitted})
+        state.human_evidence = [by_id[key] for key in sorted(by_id)]
+        result = self._reaggregate_with_human_evidence(state)
+        return self._apply_gate(state, result, final=result.mode == FINAL)
+
+    def _reaggregate_with_human_evidence(self, state: AgentState) -> VerificationResult:
+        cached = deepcopy(state.verification_result or {})
+        evidence_by_id = {item["criterion_id"]: item for item in state.human_evidence}
+        criterion_results = cached.get("criterion_results", [])
+        criteria = {item.id: item for item in state.acceptance_criteria}
+        for item in criterion_results:
+            criterion = criteria.get(item["criterion_id"])
+            evidence = evidence_by_id.get(item["criterion_id"])
+            if not criterion or criterion.verification_mode != "HUMAN" or not evidence:
+                continue
+            accepted = bool(evidence["accepted"])
+            item.update({
+                "status": PASS if accepted else FAIL,
+                "evidence_source": "HUMAN",
+                "command": None,
+                "exit_code": None,
+                "summary": f"{criterion.id} {'accepted' if accepted else 'rejected'} by human evidence",
+                "details": evidence["evidence"],
+                "verification_ids": [],
+                "evidence": [evidence],
+            })
+
+        critical_ids = {item.id for item in state.acceptance_criteria if item.criticality == "CRITICAL"}
+        verified_critical = [item["criterion_id"] for item in criterion_results if item["criterion_id"] in critical_ids and item["status"] == PASS]
+        failed_critical = [item["criterion_id"] for item in criterion_results if item["criterion_id"] in critical_ids and item["status"] == FAIL]
+        unverified_critical = [item["criterion_id"] for item in criterion_results if item["criterion_id"] in critical_ids and item["status"] == CRITERION_UNVERIFIED]
+        manual_items = [
+            item["criterion_id"] for item in criterion_results
+            if criteria[item["criterion_id"]].verification_mode == "HUMAN" and item["status"] == CRITERION_UNVERIFIED
+        ]
+        sanity_failed = any(item["status"] != PASS for item in criterion_results if item["evidence_type"] == "SANITY")
+        noncritical_auto_failed = any(
+            item["status"] == FAIL
+            and criteria[item["criterion_id"]].criticality == "NON_CRITICAL"
+            and criteria[item["criterion_id"]].verification_mode == "AUTO"
+            for item in criterion_results
+        )
+        new_failures = cached.get("new_failures", [])
+        if new_failures:
+            overall = REGRESSED
+        elif failed_critical or unverified_critical or sanity_failed or noncritical_auto_failed:
+            overall = UNVERIFIED
+        elif manual_items:
+            overall = PARTIALLY_VERIFIED
+        else:
+            overall = VERIFIED
+        summary = (
+            f"{len(verified_critical)} critical PASS; {len(failed_critical)} critical FAIL; "
+            f"{len(unverified_critical)} critical UNVERIFIED; {len(new_failures)} new regression(s); "
+            f"{len(manual_items)} manual item(s)."
+        )
+        by_type = lambda kind: [item for item in criterion_results if item["evidence_type"] == kind]
+        return VerificationResult(
+            mode=cached.get("mode", FINAL), overall_status=overall,
+            criterion_results=criterion_results,
+            target_results=by_type("TARGET"), regression_results=by_type("REGRESSION"),
+            sanity_results=by_type("SANITY"), baseline_failures=cached.get("baseline_failures", []),
+            current_failures=cached.get("current_failures", []), new_failures=new_failures,
+            verified_critical=verified_critical, unverified_critical=unverified_critical,
+            failed_critical=failed_critical, manual_items=manual_items,
+            evidence_summary=summary, human_evidence=list(state.human_evidence),
+        )
 
     def _run(self, state: AgentState, mode: str, selected: set[str]) -> VerificationResult:
         checks = [
@@ -130,7 +219,7 @@ class VerificationEngine:
 
         state.verification_result = result.to_dict()
         state.manual_confirmation_items = list(result.manual_items)
-        if status in {VERIFIED, PARTIALLY_VERIFIED}:
+        if status == VERIFIED:
             for item in result.criterion_results:
                 if item["status"] == PASS:
                     state.add_fact(f"{item['criterion_id']} verified by environment evidence: {item['summary']}")
@@ -141,6 +230,8 @@ class VerificationEngine:
             )
             result.checkpoint_result = checkpoint
             state.current_checkpoint = manager.get_current_checkpoint()
+        elif status == PARTIALLY_VERIFIED:
+            pass
         elif status == REGRESSED:
             if not self.failure_recovery:
                 evidence = {"kind": "NEW_REGRESSION", "new_failures": result.new_failures, "summary": result.evidence_summary}

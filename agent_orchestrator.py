@@ -22,7 +22,6 @@ from agent_events import (
     TOOL_FAILED,
     UNRECOVERABLE_FAILURE,
     USER_CONFIRMATION_REQUIRED,
-    USER_CONFIRMED,
     VERIFICATION_REGRESSED,
     VERIFICATION_REQUESTED,
     VERIFICATION_UNVERIFIED,
@@ -67,7 +66,7 @@ ALLOWED_TRANSITIONS = {
     (VERIFYING, INCREMENTAL_VERIFIED): EXECUTING,
     (VERIFYING, INCREMENTAL_PARTIAL): EXECUTING,
     (VERIFYING, FINAL_VERIFIED): DONE,
-    (VERIFYING, FINAL_PARTIAL): DONE,
+    (VERIFYING, FINAL_PARTIAL): VERIFYING,
     (VERIFYING, VERIFICATION_REGRESSED): DEBUGGING,
     (VERIFYING, TARGET_FAILED): DEBUGGING,
     (VERIFYING, VERIFICATION_UNVERIFIED): VERIFYING,
@@ -86,7 +85,7 @@ class AgentOrchestrator:
 
         if event.type in {MAX_STEPS_REACHED, UNRECOVERABLE_FAILURE}:
             next_phase = FAILED
-        elif event.type in {USER_CONFIRMATION_REQUIRED, USER_CONFIRMED}:
+        elif event.type == USER_CONFIRMATION_REQUIRED:
             next_phase = previous
         else:
             try:
@@ -96,10 +95,10 @@ class AgentOrchestrator:
 
         needs_confirmation = state.needs_user_confirmation
         pause = False
-        if event.type in {PLAN_BLOCKED_BY_USER_INTENT, USER_CONFIRMATION_REQUIRED, VERIFICATION_UNVERIFIED}:
+        if event.type in {PLAN_BLOCKED_BY_USER_INTENT, USER_CONFIRMATION_REQUIRED, VERIFICATION_UNVERIFIED, FINAL_PARTIAL}:
             needs_confirmation = True
             pause = True
-        elif event.type == USER_CONFIRMED:
+        elif event.type == FINAL_VERIFIED:
             needs_confirmation = False
 
         if event.type == FINISH_REQUESTED:

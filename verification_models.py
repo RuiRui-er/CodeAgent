@@ -29,6 +29,16 @@ class CriterionResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class HumanEvidence:
+    criterion_id: str
+    accepted: bool
+    evidence: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass
 class VerificationResult:
     mode: str
@@ -45,6 +55,7 @@ class VerificationResult:
     failed_critical: list[str]
     manual_items: list[str]
     evidence_summary: str
+    human_evidence: list[dict[str, Any]] = field(default_factory=list)
     recovery_result: dict[str, Any] | None = None
     checkpoint_result: dict[str, Any] | None = None
 

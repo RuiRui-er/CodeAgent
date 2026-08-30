@@ -68,6 +68,7 @@ class AgentState:
     current_checkpoint: dict[str, Any] | None = None
     verification_result: dict[str, Any] | None = None
     manual_confirmation_items: list[str] = field(default_factory=list)
+    human_evidence: list[dict[str, Any]] = field(default_factory=list)
     failed_finish_attempts: int = 0
     finish_guardrail_active: bool = False
     verification_sequence: int = 0
