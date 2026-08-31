@@ -3,6 +3,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_state import AcceptanceCriterion, AgentState, ExecutionStep, VerificationCheck, EXECUTING
+from agent_events import AgentEvent, PLAN_READY
+from agent_orchestrator import AgentOrchestrator
 from coding_agent import _capture_baseline, _record_tool_event
 from context_manager import ContextManager
 from tool_executor import ToolExecutor
@@ -28,6 +30,40 @@ class SuccessfulTools:
 
 
 class ExecutionProgressTests(unittest.TestCase):
+    def test_pre_edit_verify_step_is_consumed_when_baseline_already_exists(self):
+        from coding_agent import _complete_baseline_owned_verify_steps
+
+        state = AgentState("baseline-owned verification")
+        state.execution_plan = [
+            ExecutionStep("V", "capture baseline", "VERIFY", ["run_command"], ["AC"], [], ["VC"]),
+            ExecutionStep("I", "implement", "IMPLEMENT", ["apply_patch"], ["AC"], ["x.py"], []),
+        ]
+        state.current_step = "V"
+        state.baseline = [{"verification_id": "VC", "observation": {"status": "FAILED"}}]
+        AgentOrchestrator().transition(state, AgentEvent(PLAN_READY, "test plan ready"))
+
+        _complete_baseline_owned_verify_steps(state)
+
+        self.assertEqual(state.completed_steps, ["V"])
+        self.assertEqual(state.current_step, "I")
+
+    def test_post_edit_verify_step_is_delegated_to_final_engine(self):
+        from coding_agent import _complete_baseline_owned_verify_steps
+
+        state = AgentState("core-owned final verification")
+        state.execution_plan = [
+            ExecutionStep("V", "final checks", "VERIFY", ["finish"], ["AC"], [], ["VC"]),
+        ]
+        state.current_step = "V"
+        state.verification_contract = [check("VC", ["AC"], baseline=True)]
+        state.change_sets = [{"id": "change_0001"}]
+        AgentOrchestrator().transition(state, AgentEvent(PLAN_READY, "test plan ready"))
+
+        _complete_baseline_owned_verify_steps(state)
+
+        self.assertEqual(state.completed_steps, ["V"])
+        self.assertIsNone(state.current_step)
+
     def make_state(self):
         return AgentState(
             "fix parser",

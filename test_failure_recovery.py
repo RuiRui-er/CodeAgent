@@ -222,6 +222,13 @@ class FailureRecoveryTests(unittest.TestCase):
         self.assertIn("AssertionError", result["evidence"]["stderr"])
         self.assertIn("return []", (self.base / "parser.py").read_text(encoding="utf-8"))
 
+        before = len(state.phase_history)
+        transition = _transition_tool_result(
+            state, "apply_patch", result, None, AgentOrchestrator(),
+        )
+        self.assertIsNone(transition)
+        self.assertEqual(len(state.phase_history), before)
+
     def test_regression_is_recorded_without_second_recovery_and_unverified_is_ignored(self):
         state = state_for_failure()
         tools = FakeTools(self.base)

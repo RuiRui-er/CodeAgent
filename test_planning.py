@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 from agent_state import AgentState
-from coding_agent import WorkspaceTools, _repair_plan, _validate_plan, run_planning
+from coding_agent import PLANNING_PROMPT, WorkspaceTools, _repair_plan, _validate_plan, run_planning
+from planning_schema import project_repair_fields
 from context_manager import ContextManager
 from planning_schema import PlanningSchemaError
 
@@ -112,6 +113,96 @@ class FakePlanningClient:
 
 
 class PlanningTests(unittest.TestCase):
+    def test_demo_profile_requires_baseline_and_compact_plan(self):
+        payload = valid_plan()
+        payload["verification_contract"][0]["baseline_required"] = False
+        payload["execution_plan"] = payload["execution_plan"] * 5
+        for index, step in enumerate(payload["execution_plan"]):
+            step = dict(step)
+            step["step_id"] = f"STEP-{index}"
+            payload["execution_plan"][index] = step
+        state = AgentState("strict demo profile")
+        state.require_all_baselines = True
+        state.max_execution_plan_steps = 4
+
+        with self.assertRaises(PlanningSchemaError) as raised:
+            _validate_plan(payload, state)
+
+        self.assertIn("baseline_required", str(raised.exception))
+        self.assertIn("at most 4 concise steps", str(raised.exception))
+
+    def test_projection_deletes_unexpected_field_when_repair_omits_it(self):
+        original = valid_plan()
+        original["verification_contract"][0]["additionalProperties"] = False
+        repaired = valid_plan()
+
+        projected = project_repair_fields(
+            original,
+            repaired,
+            "$.verification_contract[0].additionalProperties: unexpected field",
+        )
+
+        self.assertNotIn("additionalProperties", projected["verification_contract"][0])
+
+    def test_run_can_require_sanity_criterion_and_check(self):
+        state = AgentState("demo requiring sanity")
+        state.required_evidence_types = {"SANITY"}
+
+        with self.assertRaisesRegex(PlanningSchemaError, "requires a SANITY criterion"):
+            _validate_plan(valid_plan(), state)
+
+    def test_demo_can_require_compile_based_sanity(self):
+        payload = valid_plan()
+        payload["acceptance_criteria"].append({
+            "id": "AC-S", "description": "Python module compiles",
+            "criticality": "NON_CRITICAL", "verification_mode": "AUTO",
+            "evidence_type": "SANITY", "verification_method": "Run py_compile and require exit code 0.",
+        })
+        payload["verification_contract"].append({
+            "id": "V-S", "description": "compile", "verification_mode": "AUTO",
+            "evidence_type": "SANITY", "verification_method": "Import module and require success.",
+            "command": [sys.executable, "-c", "import subprocess; subprocess.run(['echo'], check=True)"],
+            "baseline_required": True, "related_acceptance_criteria": ["AC-S"],
+        })
+        payload["execution_plan"][0]["related_acceptance_criteria"].append("AC-S")
+        state = AgentState("compile sanity required")
+        state.required_sanity_command_fragment = "py_compile"
+
+        with self.assertRaisesRegex(PlanningSchemaError, "must contain 'py_compile'"):
+            _validate_plan(payload, state)
+
+    def test_planning_prompt_matches_user_language_for_visible_text(self):
+        self.assertIn("same language as the user's task", PLANNING_PROMPT)
+        self.assertIn("For a Chinese task", PLANNING_PROMPT)
+        self.assertIn("TARGET, REGRESSION, SANITY", PLANNING_PROMPT)
+
+    def test_hollow_python_verification_probe_is_rejected(self):
+        payload = valid_plan()
+        payload["verification_contract"][0]["command"] = [
+            sys.executable, "-c", "import subprocess, sys, tempfile; import calculator",
+        ]
+
+        with self.assertRaisesRegex(PlanningSchemaError, "must execute the product behavior"):
+            _validate_plan(payload, AgentState("reject hollow evidence"))
+
+    def test_unparseable_submit_plan_arguments_get_a_full_schema_retry(self):
+        malformed = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": "broken", "type": "function",
+                "function": {"name": "submit_plan", "arguments": '{"task_understanding":'},
+            }],
+        }
+        client = SequenceClient([malformed, submit_response(valid_plan(), "json-repair")])
+
+        state = run_planning(
+            "Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1,
+        )
+
+        self.assertTrue(state.planning_repair_success)
+        self.assertEqual(state.planning_repair_attempts, 1)
+        self.assertEqual(state.acceptance_criteria[0].id, "AC-1")
+
     def test_human_verification_is_explicitly_disabled_without_resume_channel(self):
         payload = valid_plan()
         payload["acceptance_criteria"][0]["verification_mode"] = "HUMAN"
@@ -196,34 +287,30 @@ class PlanningTests(unittest.TestCase):
         self.assertTrue(state.planning_repair_success)
         self.assertTrue(state.planning_frozen)
 
-    def test_multi_field_repair_still_rejects_third_legal_field_change(self):
+    def test_multi_field_repair_discards_unrequested_field_change(self):
         invalid = valid_plan()
         invalid["acceptance_criteria"][0]["verification_method"] = "verify feature works"
         del invalid["verification_contract"][0]["verification_method"]
         drifted = valid_plan()
         drifted["execution_plan"][0]["description"] = "Unrelated rewritten step"
-        client = SequenceClient([
-            submit_response(invalid),
-            submit_response(drifted, "repair-extra-1"),
-            submit_response(drifted, "repair-extra-2"),
-        ])
+        client = SequenceClient([submit_response(invalid), submit_response(drifted, "repair-extra")])
 
-        with self.assertRaisesRegex(RuntimeError, "outside"):
-            run_planning("Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1)
+        state = run_planning("Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1)
 
-    def test_repair_rejects_unrelated_core_semantic_change(self):
+        self.assertEqual(state.execution_plan[0].description, invalid["execution_plan"][0]["description"])
+        self.assertTrue(state.planning_repair_success)
+
+    def test_repair_discards_unrelated_core_semantic_change(self):
         invalid = valid_plan()
         invalid["acceptance_criteria"][0]["verification_method"] = "verify feature works"
         drifted = valid_plan()
         drifted["acceptance_criteria"][0]["description"] = "Different behavior"
-        client = SequenceClient([
-            submit_response(invalid),
-            submit_response(drifted, "repair-drift-1"),
-            submit_response(drifted, "repair-drift-2"),
-        ])
+        client = SequenceClient([submit_response(invalid), submit_response(drifted, "repair-drift")])
 
-        with self.assertRaisesRegex(RuntimeError, "protected core semantics"):
-            run_planning("Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1)
+        state = run_planning("Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1)
+
+        self.assertEqual(state.acceptance_criteria[0].description, invalid["acceptance_criteria"][0]["description"])
+        self.assertTrue(state.planning_repair_success)
 
     def test_frozen_plan_cannot_enter_repair_again(self):
         client = SequenceClient([submit_response(valid_plan())])
@@ -246,10 +333,32 @@ class PlanningTests(unittest.TestCase):
             submit_response(invalid),
             submit_response(invalid, "repair-1"),
             submit_response(invalid, "repair-2"),
+            submit_response(invalid, "repair-3"),
         ])
-        with self.assertRaisesRegex(RuntimeError, "repair failed after 2 attempts"):
+        with self.assertRaisesRegex(RuntimeError, "repair failed after 3 attempts"):
             run_planning("Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1)
-        self.assertEqual(len(client.messages), 3)
+        self.assertEqual(len(client.messages), 4)
+
+    def test_malformed_field_repair_keeps_original_repair_paths(self):
+        invalid = valid_plan()
+        del invalid["verification_contract"][0]["verification_method"]
+        malformed = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": "bad-repair", "type": "function",
+                "function": {"name": "submit_plan", "arguments": '{"verification_contract":'},
+            }],
+        }
+        client = SequenceClient([
+            submit_response(invalid), malformed, submit_response(valid_plan(), "good-repair"),
+        ])
+
+        state = run_planning(
+            "Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1,
+        )
+
+        self.assertTrue(state.planning_repair_success)
+        self.assertIn("invalid tool arguments", client.messages[2][-1]["content"])
 
     def test_last_planning_turn_requires_plan_submission(self):
         explore = {
@@ -267,6 +376,23 @@ class PlanningTests(unittest.TestCase):
         self.assertIn("read_file", client.tool_names[0])
         self.assertEqual(client.tool_names[1], ["submit_plan"])
         self.assertIn("final PLANNING turn", client.messages[1][0]["content"])
+
+    def test_final_turn_wrong_tool_is_replaced_by_full_plan_retry(self):
+        wrong_tool = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": "wrong", "type": "function",
+                "function": {"name": "read_file", "arguments": json.dumps({"path": "calculator.py"})},
+            }],
+        }
+        client = SequenceClient([wrong_tool, submit_response(valid_plan(), "retry-plan")])
+
+        state = run_planning(
+            "Fix divide", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1,
+        )
+
+        self.assertTrue(state.planning_repair_success)
+        self.assertEqual(state.current_step, "STEP-1")
 
     def test_repeated_reads_get_nudge_without_losing_read_tools(self):
         read = {

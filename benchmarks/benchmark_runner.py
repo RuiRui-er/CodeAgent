@@ -10,6 +10,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -209,8 +210,12 @@ def _run_once(task_dir: Path, task: TaskSpec, variant, run_number: int, save_dem
 def reset_task_repo(task_dir: Path, workspace: Path, expected_commit: str) -> str:
     source = task_dir / "repo"
     if workspace.exists():
-        shutil.rmtree(workspace)
-    shutil.copytree(source, workspace)
+        _remove_tree(workspace)
+    shutil.copytree(
+        source,
+        workspace,
+        ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc"),
+    )
     _git(workspace, ["init", "-q"])
     _git(workspace, ["config", "user.name", "CodeAgent Benchmark"])
     _git(workspace, ["config", "user.email", "benchmark@example.invalid"])
@@ -226,6 +231,14 @@ def reset_task_repo(task_dir: Path, workspace: Path, expected_commit: str) -> st
     if status:
         raise RuntimeError(f"task reset left a dirty workspace: {status}")
     return commit
+
+
+def _remove_tree(path: Path) -> None:
+    def handle_readonly(function, target, _error):
+        Path(target).chmod(stat.S_IWRITE)
+        function(target)
+
+    shutil.rmtree(path, onerror=handle_readonly)
 
 
 def _build_run_result(run_id, task, variant, state, recorder, hidden, termination_reason, initial_commit):

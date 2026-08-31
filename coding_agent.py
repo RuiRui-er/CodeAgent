@@ -56,6 +56,7 @@ from planning_schema import (
     MAX_PLANNING_REPAIR_ATTEMPTS,
     PlanningSchemaError,
     build_repair_instruction,
+    project_repair_fields,
     validate_repair_scope,
     validate_schema,
 )
@@ -97,6 +98,12 @@ may produce its ChangeSets. For every VERIFY step, set related_verification_ids 
 exact frozen checks whose commands complete that step. Use an empty list for fields not
 applicable to a step. HUMAN verification is disabled in this CLI because confirmation
 cannot yet resume the same AgentState; express only criteria with executable AUTO evidence.
+Write user-facing planning text in the same language as the user's task. This applies
+to task_understanding and the description and verification_method fields of Acceptance
+Criteria, Verification Contract checks, and Execution Plan steps. For a Chinese task,
+these explanations must be Chinese. Keep technical state names and evidence types such
+as PLANNING, TARGET, REGRESSION, SANITY, VERIFIED, ChangeSet, commands, file paths,
+symbols, code identifiers, and CLI flags in their original English/code form.
 Do not propose multiple agents, RAG, or UI.
 """
 
@@ -249,6 +256,7 @@ class OpenAICompatibleClient:
         self,
         messages: list[dict[str, Any]],
         tool_schemas: list[dict[str, Any]] | None = None,
+        required_tool: str | None = None,
     ) -> dict[str, Any]:
         body_data: dict[str, Any] = {
             "model": self.model,
@@ -256,7 +264,10 @@ class OpenAICompatibleClient:
         }
         if tool_schemas:
             body_data["tools"] = tool_schemas
-            body_data["tool_choice"] = "auto"
+            body_data["tool_choice"] = (
+                {"type": "function", "function": {"name": required_tool}}
+                if required_tool else "auto"
+            )
         body = json.dumps(body_data).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -284,6 +295,13 @@ def log(label: str, value: Any) -> None:
         print(value, flush=True)
     else:
         print(json.dumps(value, ensure_ascii=False, indent=2), flush=True)
+
+
+def _complete_with_required_tool(client, messages, schemas, tool_name):
+    """Force a lifecycle-required tool for the real API while keeping test doubles simple."""
+    if isinstance(client, OpenAICompatibleClient):
+        return client.complete(messages, schemas, required_tool=tool_name)
+    return client.complete(messages, schemas)
 
 
 def _parse_tool_arguments(tool_call: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
@@ -323,6 +341,7 @@ def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
                 )
     raw_checks = payload.get("verification_contract", [])
     if isinstance(raw_checks, list):
+        seen_commands: dict[tuple[str, ...], int] = {}
         for index, item in enumerate(raw_checks):
             if not isinstance(item, dict):
                 continue
@@ -336,6 +355,60 @@ def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
                 validation_errors.append(
                     f"$.verification_contract[{index}].command: AUTO verification requires a non-empty command"
                 )
+            if state.require_all_baselines and item.get("baseline_required") is not True:
+                validation_errors.append(
+                    f"$.verification_contract[{index}].baseline_required: this run requires every "
+                    "frozen check to execute before modification"
+                )
+            command = item.get("command")
+            if item.get("verification_mode") == "AUTO" and isinstance(command, list) and command:
+                if not _substantive_verification_command(command):
+                    validation_errors.append(
+                        f"$.verification_contract[{index}].command: command must execute the product behavior "
+                        "and fail non-zero when the stated expected result is not met"
+                    )
+                signature = tuple(command)
+                if signature in seen_commands:
+                    validation_errors.append(
+                        f"$.verification_contract[{index}].command: duplicates verification_contract"
+                        f"[{seen_commands[signature]}].command; each distinct check needs distinct evidence"
+                    )
+                else:
+                    seen_commands[signature] = index
+    for evidence_type in state.required_evidence_types:
+        if not any(
+            isinstance(item, dict) and item.get("evidence_type") == evidence_type
+            for item in raw_criteria
+        ):
+            validation_errors.append(
+                f"$.acceptance_criteria: this run requires a {evidence_type} criterion"
+            )
+        if not any(
+            isinstance(item, dict) and item.get("evidence_type") == evidence_type
+            for item in raw_checks
+        ):
+            validation_errors.append(
+                f"$.verification_contract: this run requires an executable {evidence_type} check"
+            )
+    if state.required_sanity_command_fragment:
+        for index, item in enumerate(raw_checks):
+            if isinstance(item, dict) and item.get("evidence_type") == "SANITY":
+                command_text = " ".join(str(part) for part in item.get("command", []))
+                if state.required_sanity_command_fragment not in command_text:
+                    validation_errors.append(
+                        f"$.verification_contract[{index}].command: SANITY command must contain "
+                        f"{state.required_sanity_command_fragment!r}"
+                    )
+    raw_steps = payload.get("execution_plan", [])
+    if (
+        state.max_execution_plan_steps is not None
+        and isinstance(raw_steps, list)
+        and len(raw_steps) > state.max_execution_plan_steps
+    ):
+        validation_errors.append(
+            f"$.execution_plan: this run allows at most {state.max_execution_plan_steps} concise steps; "
+            "baseline and final Verification Contract execution are core-owned"
+        )
     if validation_errors:
         raise PlanningSchemaError(list(dict.fromkeys(validation_errors)))
 
@@ -376,9 +449,16 @@ def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
         for criterion_id in step.related_acceptance_criteria
     }
     if verified_criteria != known:
-        raise ValueError("every acceptance criterion must be covered by the verification contract")
-    if planned_criteria != known:
-        raise ValueError("every acceptance criterion must be covered by the execution plan")
+        raise PlanningSchemaError(
+            "$.verification_contract: every acceptance criterion must be covered by the verification contract"
+        )
+    implementation_criteria = {
+        criterion.id for criterion in criteria if criterion.evidence_type != "SANITY"
+    }
+    if not implementation_criteria <= planned_criteria:
+        raise PlanningSchemaError(
+            "$.execution_plan: every TARGET and REGRESSION criterion must be covered by the execution plan"
+        )
     state.task_understanding = payload["task_understanding"]
     state.acceptance_criteria = criteria
     state.verification_contract = checks
@@ -395,6 +475,28 @@ def _specific_verification_method(method: str) -> bool:
         return False
     vague = {"verify feature works", "verify it works", "check correctness", "test feature"}
     return normalized not in vague
+
+
+def _substantive_verification_command(command: list[str]) -> bool:
+    """Reject hollow Python probes that merely import modules and always exit zero."""
+    lowered = [str(item).lower() for item in command]
+    if "-c" not in lowered:
+        return True
+    index = lowered.index("-c")
+    if index + 1 >= len(command):
+        return False
+    code = command[index + 1]
+    executes_product = (
+        "subprocess." in code or "runpy.run_path" in code or "py_compile.compile" in code
+    )
+    enforces_result = any(
+        marker in code for marker in (
+            "assert ", "sys.exit(", "SystemExit(", "raise AssertionError",
+            "check=True", "check_call(", "check_output(",
+            "doraise=True",
+        )
+    )
+    return len(code) >= 80 and executes_product and enforces_result
 
 
 def _repair_plan(
@@ -415,31 +517,19 @@ def _repair_plan(
         if repair_rejection:
             prompt_error += f"\nPrevious repair rejection (not an allowed path): {repair_rejection}"
         prompt = build_repair_instruction(current_payload, prompt_error, attempt)
-        messages = context_manager.build_messages(state, PLANNING_PROMPT)
+        messages = context_manager.build_messages(
+            state, PLANNING_PROMPT + _runtime_command_guidance(context_manager.workspace),
+        )
         messages.append({"role": "user", "content": prompt})
         log(f"PLANNING SCHEMA REPAIR {attempt}/{MAX_PLANNING_REPAIR_ATTEMPTS}", current_error)
-        message = client.complete(messages, [SUBMIT_PLAN_SCHEMA])
-        calls = message.get("tool_calls") or []
-        submit = next(
-            (call for call in calls if call.get("function", {}).get("name") == "submit_plan"),
-            None,
-        )
-        if submit is None:
-            current_error = "$: repair response must contain exactly a submit_plan tool call"
+        repaired, serialization_error = _request_parseable_plan_repair(client, messages)
+        if repaired is None:
+            repair_rejection = serialization_error
             state.planning_validation_failures += 1
             continue
-        repaired, parse_error = _parse_tool_arguments(submit)
-        if parse_error:
-            current_error = parse_error
-            state.planning_validation_failures += 1
-            current_payload = repaired
-            continue
-        try:
-            validate_repair_scope(current_payload, repaired, current_error)
-        except PlanningSchemaError as exc:
-            repair_rejection = str(exc)
-            state.planning_validation_failures += 1
-            continue
+        log("PLANNING REPAIR CANDIDATE", repaired)
+        repaired = project_repair_fields(current_payload, repaired, current_error)
+        validate_repair_scope(current_payload, repaired, current_error)
         try:
             repaired_state = _validate_plan(repaired, state)
         except (KeyError, TypeError, ValueError, PlanningSchemaError) as exc:
@@ -453,6 +543,91 @@ def _repair_plan(
     raise RuntimeError(
         f"PLANNING schema repair failed after {MAX_PLANNING_REPAIR_ATTEMPTS} attempts; "
         f"last validation error: {repair_rejection or current_error}"
+    )
+
+
+def _request_parseable_plan_repair(client, messages) -> tuple[dict[str, Any] | None, str | None]:
+    """Retry wire-format failures without consuming semantic repair attempts."""
+    current_messages = list(messages)
+    last_error: str | None = None
+    for retry in range(1, 4):
+        message = _complete_with_required_tool(
+            client, current_messages, [SUBMIT_PLAN_SCHEMA], "submit_plan",
+        )
+        calls = message.get("tool_calls") or []
+        submit = next(
+            (call for call in calls if call.get("function", {}).get("name") == "submit_plan"),
+            None,
+        )
+        if submit is None:
+            last_error = "$: repair response must contain exactly a submit_plan tool call"
+        else:
+            repaired, parse_error = _parse_tool_arguments(submit)
+            if not parse_error:
+                return repaired, None
+            last_error = parse_error
+        log(f"PLANNING REPAIR JSON RETRY {retry}/3", last_error)
+        current_messages = list(messages) + [{
+            "role": "user",
+            "content": (
+                "The previous submit_plan arguments were not valid JSON. Resend the same semantic "
+                "repair as exactly one submit_plan tool call. Ensure every quote, backslash, newline, "
+                f"and comma is valid JSON. Parser error: {last_error}"
+            ),
+        }]
+    return None, last_error
+
+
+def _repair_unparseable_plan(
+    parse_error: str,
+    state: AgentState,
+    client: OpenAICompatibleClient,
+    context_manager: ContextManager,
+) -> AgentState:
+    """Retry a submit_plan whose tool arguments were not valid JSON at all."""
+    current_error = parse_error
+    for attempt in range(1, MAX_PLANNING_REPAIR_ATTEMPTS + 1):
+        state.planning_repair_attempts += 1
+        messages = context_manager.build_messages(
+            state, PLANNING_PROMPT + _runtime_command_guidance(context_manager.workspace),
+        )
+        messages.append({
+            "role": "user",
+            "content": (
+                "Your submit_plan tool arguments were not valid JSON and could not be parsed. "
+                "Regenerate the complete plan from the task and inspected code. Call submit_plan "
+                "exactly once; return no prose and no other tool call. All fields must satisfy the "
+                f"provided submit_plan schema. Parser error: {current_error}"
+            ),
+        })
+        log(f"PLANNING JSON REPAIR {attempt}/{MAX_PLANNING_REPAIR_ATTEMPTS}", current_error)
+        message = _complete_with_required_tool(
+            client, messages, [SUBMIT_PLAN_SCHEMA], "submit_plan",
+        )
+        calls = message.get("tool_calls") or []
+        submit = next(
+            (call for call in calls if call.get("function", {}).get("name") == "submit_plan"),
+            None,
+        )
+        if submit is None:
+            current_error = "$: JSON repair response must contain a submit_plan tool call"
+            state.planning_validation_failures += 1
+            continue
+        repaired, next_parse_error = _parse_tool_arguments(submit)
+        if next_parse_error:
+            current_error = next_parse_error
+            state.planning_validation_failures += 1
+            continue
+        try:
+            repaired_state = _validate_plan(repaired, state)
+        except (KeyError, TypeError, ValueError, PlanningSchemaError) as exc:
+            state.planning_validation_failures += 1
+            return _repair_plan(repaired, str(exc), state, client, context_manager)
+        state.planning_repair_success = True
+        return repaired_state
+    raise RuntimeError(
+        f"PLANNING JSON repair failed after {MAX_PLANNING_REPAIR_ATTEMPTS} attempts; "
+        f"last error: {current_error}"
     )
 
 
@@ -677,13 +852,46 @@ def _complete_successful_baseline_steps(state: AgentState) -> None:
         state.complete_current_step()
 
 
+def _runtime_command_guidance(tools: WorkspaceTools | Path) -> str:
+    root = tools.root if hasattr(tools, "root") else Path(tools)
+    return f"""
+
+Runtime command contract (authoritative):
+- Operating system: {os.name}; workspace root: {root}; Python executable: {sys.executable}
+- Do not invent Unix paths such as /tmp or /Users, and do not use bash, sh, shell
+  redirection, pipes, &&, semicolons, cd, echo, printf, or interactive commands.
+- run_command executes argv directly with shell=False and already uses the workspace as cwd.
+- Always provide command as a JSON argv array. For Python checks, argv[0] must be
+  {json.dumps(sys.executable)}. A self-contained `python -c` script may create a
+  temporary input inside the workspace, invoke csv_tool.py with subprocess using
+  sys.executable, assert exit code/stdout, and delete the input in a finally block.
+- Never place literal newlines or `\\n` escape sequences inside a Python `-c` string
+  literal carried through JSON. Build CSV text without escapes, for example:
+  `chr(10).join(['name,age', 'Alice,20', 'Broken,']) + chr(10)`.
+- Verification Contract commands must be deterministic, non-interactive, workspace-scoped,
+  and safe without user confirmation. Freeze TARGET, REGRESSION, and SANITY checks before edits.
+- The core runs every frozen Verification Contract command once before execution and stores
+  the Baseline automatically. Do not add execution steps that create, record, or rerun baseline.
+  The execution plan should inspect/edit the product and then call finish; finish triggers the
+  core's final verification, so do not manually rerun the frozen checks during EXECUTING.
+"""
+
+
 def run_planning(
     task: str,
     tools: WorkspaceTools,
     client: OpenAICompatibleClient,
     max_planning_steps: int,
+    required_evidence_types: set[str] | None = None,
+    require_all_baselines: bool = False,
+    max_execution_plan_steps: int | None = None,
+    required_sanity_command_fragment: str | None = None,
 ) -> AgentState:
     state = AgentState(original_task=task)
+    state.required_evidence_types = sorted(required_evidence_types or ())
+    state.require_all_baselines = require_all_baselines
+    state.max_execution_plan_steps = max_execution_plan_steps
+    state.required_sanity_command_fragment = required_sanity_command_fragment
     state.current_checkpoint = tools.checkpoint_manager.get_current_checkpoint()
     context_manager = ContextManager(tools.root)
     trajectory: list[dict[str, Any]] = []
@@ -692,7 +900,7 @@ def run_planning(
     for step in range(1, max_planning_steps + 1):
         finalizing = step == max_planning_steps
         converging = stagnant_exploration_turns >= PLANNING_STAGNATION_NUDGE_AFTER
-        prompt = PLANNING_PROMPT
+        prompt = PLANNING_PROMPT + _runtime_command_guidance(tools)
         if converging and not finalizing:
             prompt += PLANNING_CONVERGENCE_PROMPT
         if finalizing:
@@ -700,15 +908,38 @@ def run_planning(
         available_tools = [SUBMIT_PLAN_SCHEMA] if finalizing else planning_tools
         messages = context_manager.build_messages(state, prompt)
         log(f"PLANNING STEP {step}/{max_planning_steps}", {"trajectory_events": len(trajectory)})
-        message = client.complete(messages, available_tools)
+        message = (
+            _complete_with_required_tool(client, messages, available_tools, "submit_plan")
+            if finalizing else client.complete(messages, available_tools)
+        )
         trajectory.append({"assistant": message})
         if message.get("content"):
             log("PLANNING MESSAGE", message["content"])
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
+            if finalizing:
+                state.planning_validation_failures += 1
+                state = _repair_unparseable_plan(
+                    "$: final PLANNING response did not call submit_plan",
+                    state, client, context_manager,
+                )
+                if not state.clarification_needed:
+                    _capture_baseline(state, tools)
+                return state
             state.add_action({"model_message": message.get("content") or "No tool call returned."})
             stagnant_exploration_turns = 0
             continue
+        if finalizing and not any(
+            call.get("function", {}).get("name") == "submit_plan" for call in tool_calls
+        ):
+            state.planning_validation_failures += 1
+            state = _repair_unparseable_plan(
+                "$: final PLANNING response called an unavailable tool instead of submit_plan",
+                state, client, context_manager,
+            )
+            if not state.clarification_needed:
+                _capture_baseline(state, tools)
+            return state
         knowledge_before = (
             frozenset(state.relevant_files),
             frozenset(state.relevant_symbols),
@@ -721,6 +952,17 @@ def run_planning(
                 exploration_only = False
             arguments, parse_error = _parse_tool_arguments(tool_call)
             log("PLANNING TOOL CALL", {"name": name, "arguments": arguments})
+            if parse_error and name == "submit_plan":
+                state.planning_validation_failures += 1
+                state = _repair_unparseable_plan(parse_error, state, client, context_manager)
+                if not state.clarification_needed:
+                    _capture_baseline(state, tools)
+                log("Task Understanding", state.task_understanding)
+                log("Acceptance Criteria", [asdict(item) for item in state.acceptance_criteria])
+                log("Verification Contract", [asdict(item) for item in state.verification_contract])
+                log("Baseline", state.baseline)
+                log("Execution Plan", [asdict(item) for item in state.execution_plan])
+                return state
             if parse_error:
                 result = {"status": "FAILED", "tool": name, "reason": parse_error}
             elif name == "submit_plan":
@@ -770,7 +1012,7 @@ def run_execution(
     max_steps: int,
     orchestrator: AgentOrchestrator | None = None,
 ) -> str:
-    execution_prompt = SYSTEM_PROMPT + """
+    execution_prompt = SYSTEM_PROMPT + _runtime_command_guidance(tools) + """
 
 PLANNING is complete. Follow the structured plan below. The acceptance criteria and
 verification contract were fixed before implementation; do not rewrite or weaken
@@ -786,6 +1028,8 @@ files as the only source of truth for current code.
     failure_recovery = FailureRecovery(tools)
     verification_engine = VerificationEngine(tools, failure_recovery=failure_recovery)
     trajectory: list[dict[str, Any]] = []
+    previous_progress: tuple[str | None, int] | None = None
+    stagnant_execution_turns = 0
 
     for step in range(1, max_steps + 1):
         if state.needs_user_confirmation:
@@ -794,6 +1038,7 @@ files as the only source of truth for current code.
             return final
         if state.current_phase == PLANNING:
             run_replanning(state, tools, client, context_manager, orchestrator)
+        _complete_baseline_owned_verify_steps(state)
         if state.current_phase == EXECUTING and state.execution_plan_complete():
             final = _request_final_verification(
                 state, verification_engine, orchestrator,
@@ -802,9 +1047,61 @@ files as the only source of truth for current code.
             if final is not None:
                 return final
             continue
-        messages = context_manager.build_messages(state, execution_prompt)
+        progress = (state.current_step, len(state.change_sets))
+        if progress == previous_progress:
+            stagnant_execution_turns += 1
+        else:
+            stagnant_execution_turns = 0
+        previous_progress = progress
+        current = state.current_execution_step()
+        converging = (
+            stagnant_execution_turns >= 2
+            and state.current_phase == EXECUTING
+            and current is not None
+            and current.step_kind == "IMPLEMENT"
+        )
+        stale_edit_converging = (
+            stagnant_execution_turns >= 2
+            and state.current_phase == DEBUGGING
+            and bool(state.change_sets)
+            and (state.current_failure or {}).get("evidence", {}).get("status") == "STALE_EDIT"
+        )
+        request_prompt = execution_prompt
+        if converging:
+            request_prompt += """
+
+Execution convergence requirement: repeated inspection has not advanced the current
+IMPLEMENT step. The relevant file is already present in context. Do not inspect it
+again. Call apply_patch now with file, operation, intent, symbol when applicable,
+old_block copied exactly from Relevant Code, and the complete new_block.
+"""
+        if stale_edit_converging:
+            request_prompt += """
+
+Debugging convergence requirement: the failed edit was STALE_EDIT and an earlier
+ChangeSet is still applied. Re-reading the unchanged file is no longer diagnostic.
+Call finish now so the frozen Verification Contract, rather than visual inspection,
+decides whether that applied change is sufficient. finish does not bypass verification.
+"""
+        messages = context_manager.build_messages(state, request_prompt)
         log(f"STEP {step}/{max_steps} - MODEL REQUEST", {"trajectory_events": len(trajectory)})
-        message = client.complete(messages, tool_schemas_for_phase(state.current_phase))
+        schemas = tool_schemas_for_phase(state.current_phase)
+        if converging:
+            schemas = [
+                schema for schema in schemas
+                if schema["function"]["name"] not in {"read_file", "list_dir", "search_code"}
+            ]
+        if stale_edit_converging:
+            schemas = [
+                schema for schema in schemas
+                if schema["function"]["name"] == "finish"
+            ]
+        if stale_edit_converging:
+            message = _complete_with_required_tool(client, messages, schemas, "finish")
+        elif converging:
+            message = _complete_with_required_tool(client, messages, schemas, "apply_patch")
+        else:
+            message = client.complete(messages, schemas)
         trajectory.append({"assistant": message})
         if message.get("content"):
             log("MODEL MESSAGE", message["content"])
@@ -863,6 +1160,29 @@ files as the only source of truth for current code.
     return final
 
 
+def _complete_baseline_owned_verify_steps(state: AgentState) -> None:
+    """Delegate VERIFY steps to baseline capture or the final VerificationEngine."""
+    if state.current_phase != EXECUTING:
+        return
+    baseline_ids = {item.get("verification_id") for item in state.baseline}
+    contract_ids = {item.id for item in state.verification_contract}
+    while True:
+        step = state.current_execution_step()
+        if (
+            step is None
+            or step.step_kind != "VERIFY"
+            or not step.related_verification_ids
+        ):
+            return
+        required = set(step.related_verification_ids)
+        if state.change_sets:
+            if not required <= contract_ids:
+                return
+        elif not required <= baseline_ids:
+            return
+        state.complete_current_step()
+
+
 def _request_final_verification(
     state: AgentState,
     verification_engine: VerificationEngine,
@@ -892,6 +1212,8 @@ def _transition_tool_result(
     orchestrator: AgentOrchestrator,
 ):
     status = result.get("status")
+    if result.get("reason") == "DUPLICATE_FAILED_ACTION":
+        return None
     if status == "APPLIED" and name == "apply_patch":
         return orchestrator.transition(state, AgentEvent(EDIT_APPLIED, "structured edit applied"))
     if status == "SUCCESS" and name == "run_command" and state.current_phase == DEBUGGING:

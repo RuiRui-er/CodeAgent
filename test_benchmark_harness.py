@@ -35,7 +35,14 @@ class BenchmarkHarnessTests(unittest.TestCase):
         for task_dir in task_dirs:
             task = load_task(task_dir)
             workspace = self.sandbox / task.task_id
-            self.assertEqual(reset_task_repo(task_dir, workspace, task.initial_commit), task.initial_commit)
+            initial = reset_task_repo(task_dir, workspace, task.initial_commit)
+            if task.initial_commit == "AUTO_DETERMINISTIC":
+                repeated = reset_task_repo(task_dir, workspace, task.initial_commit)
+                self.assertEqual(initial, repeated)
+            else:
+                self.assertEqual(initial, task.initial_commit)
+            self.assertFalse(any(path.name == "__pycache__" for path in workspace.rglob("__pycache__")))
+            self.assertFalse(any(workspace.rglob("*.pyc")))
             self.assertFalse(evaluate_hidden(task_dir, workspace, task).success)
             self.assertFalse((workspace / "hidden_tests").exists())
 

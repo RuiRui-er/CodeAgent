@@ -91,6 +91,10 @@ class AgentState:
     planning_repair_attempts: int = 0
     planning_repair_success: bool = False
     planning_frozen: bool = False
+    required_evidence_types: list[str] = field(default_factory=list)
+    require_all_baselines: bool = False
+    max_execution_plan_steps: int | None = None
+    required_sanity_command_fragment: str | None = None
 
     def planning_snapshot(self) -> dict[str, Any]:
         return asdict(self)

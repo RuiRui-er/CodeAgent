@@ -13,7 +13,7 @@ AutoGen 等 Agent 框架或 SDK；Agent 循环、消息历史、工具定义与�
 - 一个支持 OpenAI Chat Completions 与原生 tool calling 的模型服务
 - 无第三方 Python 依赖
 
-先通过系统环境变量提供凭据和模型配置（不要写入项目文件）：
+主入口 `coding_agent.py` 通过系统环境变量读取凭据和模型配置：
 
 ```text
 OPENAI_API_KEY      必填
@@ -198,6 +198,47 @@ python demo_evidence_gated_verification.py
 python demo_failure_aware_recovery.py
 python demo_state_machine.py
 ```
+
+### 两分钟 Rich 演示
+
+视频演示依赖单独列在 `requirements-demo.txt` 中的 `rich`。安装后可运行：
+
+```powershell
+python demo_video_cli.py csv
+python demo_video_cli.py recovery
+```
+
+默认命令使用 deterministic model fixture 固定模型的 tool-call 序列，适合录屏复现；它不固定
+任何 ToolResult、verification status、recovery 或 hidden evaluator 结果。若要让真实模型自主
+完成代码修改，先复制并填写配置：
+
+```powershell
+Copy-Item .env.example .env
+python demo_video_cli.py csv --live-model
+```
+
+启动后会显示“向 Agent 提交任务”输入框；直接回车会使用 CSV benchmark 的默认任务，也可以
+输入自己的任务。录屏时若不想现场输入，可使用 `--task "任务内容"`。`.env` 会自动读取，
+无需每次在 PowerShell 中设置 `$env:OPENAI_*`。
+
+`--live-model` 仍使用 benchmark 自带的中文 Acceptance Criteria、Verification Contract 和
+三步演示计划；真实模型负责读取当前代码并选择 Structured Edit。这样同一组修改前冻结的
+输入/断言可用于每次录屏，避免模型凭空生成 pytest 或无关 SANITY。它不是“模型自主规划”
+模式，运行结果中的 `decision_source` 会明确记录为 `FROZEN_DEMO_PLAN+LIVE_MODEL_EXECUTION`。
+
+`csv` 使用 `benchmarks/tasks/csv_tool_video/repo` 的独立 Git workspace，真实运行冻结的
+SANITY / TARGET / REGRESSION baseline、Structured Edit、ChangeSet、final Evidence
+Gate、Stable Checkpoint 和独立 hidden evaluator。验证命令在修改前冻结，并在命令内部创建
+和清理最小 CSV 输入；仓库没有 pytest/unittest 测试。
+
+`recovery` 是 deterministic recovery fixture：它明确注入一个“新功能通过但默认行为回归”
+的候选编辑，然后由真实 VerificationEngine 检出 `REGRESSED`，真实执行 ChangeSet Undo，
+进入 DEBUGGING，再应用修复并重新验证。固定第一步仅用于保证录屏可复现，不冒充模型自然
+选择；所有工具结果、证据、状态迁移、恢复和 checkpoint 均来自核心对象。
+
+Rich renderer 只读取 `AgentState`、`TransitionResult`、ToolResult 和 VerificationResult，
+不修改 phase、不决定验证状态，也不执行恢复。核心模块的详细原始日志保存于每次运行目录下
+的 `core_agent.log`，终端只展示适合录屏的结构化摘要。
 
 ## 状态机收口
 

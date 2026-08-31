@@ -1,0 +1,11 @@
+{
+  "task_id": "recovery_video",
+  "category": "deterministic_recovery_fixture",
+  "description": "Add --prefix TEXT to label_tool.py while preserving output when the option is omitted.",
+  "initial_commit": "AUTO_DETERMINISTIC",
+  "critical_criteria": ["--prefix adds TEXT before the name", "default output remains unchanged", "label_tool.py remains compilable"],
+  "noncritical_criteria": [],
+  "expected_files": ["label_tool.py"],
+  "hidden_test_command": ["{python}", "hidden_tests/check.py", "{workspace}"],
+  "notes": "Deterministic fixture exercises the real ChangeSet undo and DEBUGGING pipeline."
+}

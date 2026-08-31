@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from typing import Any
 
 
-MAX_PLANNING_REPAIR_ATTEMPTS = 2
+MAX_PLANNING_REPAIR_ATTEMPTS = 3
 ACCEPTANCE_CRITERION_CORE_FIELDS = {
     "id", "description", "criticality", "verification_mode", "evidence_type",
 }
@@ -66,6 +67,9 @@ do not inspect files, and do not change the meaning or IDs of existing Acceptanc
 Criteria. The Acceptance Criterion core fields id, description, criticality,
 verification_mode, and evidence_type are immutable. Modify only fields named by the
 complete validation error list; preserve every other field. Do not invent default filler text.
+If an error says an unexpected field, omit that field in the repaired object. If an
+error names an entire collection because a required evidence item is missing, preserve
+all existing items and append only the required criterion/check with a new unique ID.
 verification_method must state a concrete command, test, input/output check, or manual
 procedure and its required result. Return only a submit_plan tool call.
 
@@ -91,22 +95,86 @@ def validate_repair_scope(
         raise PlanningSchemaError("$: validation error does not identify a repairable field")
     before = original.get("acceptance_criteria")
     after = repaired.get("acceptance_criteria")
-    if not isinstance(before, list) or not isinstance(after, list) or len(before) != len(after):
-        raise PlanningSchemaError("$.acceptance_criteria: repair changed the criteria collection")
-    for index, original_item in enumerate(before):
-        if not isinstance(original_item, dict) or not isinstance(after[index], dict):
-            continue
-        for field in ACCEPTANCE_CRITERION_CORE_FIELDS:
-            if original_item.get(field) != after[index].get(field):
-                raise PlanningSchemaError(
-                    f"$.acceptance_criteria[{index}].{field}: repair changed protected core semantics"
-                )
+    if "$.acceptance_criteria" not in allowed_paths:
+        if not isinstance(before, list) or not isinstance(after, list) or len(before) != len(after):
+            raise PlanningSchemaError("$.acceptance_criteria: repair changed the criteria collection")
+        for index, original_item in enumerate(before):
+            if not isinstance(original_item, dict) or not isinstance(after[index], dict):
+                continue
+            for field in ACCEPTANCE_CRITERION_CORE_FIELDS:
+                if original_item.get(field) != after[index].get(field):
+                    raise PlanningSchemaError(
+                        f"$.acceptance_criteria[{index}].{field}: repair changed protected core semantics"
+                    )
     changed_paths: list[str] = []
     _collect_changed_paths(original, repaired, "$", changed_paths)
-    disallowed = [path for path in changed_paths if path not in allowed_paths]
+    disallowed = [
+        path for path in changed_paths
+        if not any(
+            path == allowed or path.startswith(allowed + ".") or path.startswith(allowed + "[")
+            for allowed in allowed_paths
+        )
+    ]
     if disallowed:
         allowed_label = ", ".join(sorted(allowed_paths))
         raise PlanningSchemaError(f"{disallowed[0]}: repair changed a field outside [{allowed_label}]")
+
+
+def project_repair_fields(
+    original: dict[str, Any], repaired: dict[str, Any], validation_error: str,
+) -> dict[str, Any]:
+    """Copy only explicitly invalid fields from a model repair into the original plan.
+
+    Models sometimes rephrase valid neighbouring fields while repairing JSON. Those
+    edits are neither needed nor trusted: projection keeps the original payload as the
+    source of truth and admits values only at paths named by local validation.
+    """
+    allowed_paths = _validation_error_paths(validation_error)
+    if not allowed_paths:
+        raise PlanningSchemaError("$: validation error does not identify a repairable field")
+    projected = deepcopy(original)
+    for path in allowed_paths:
+        tokens = _path_tokens(path)
+        found, value = _read_path(repaired, tokens)
+        if found:
+            _write_path(projected, tokens, deepcopy(value))
+        elif "unexpected field" in validation_error and _path_exists(projected, tokens):
+            _delete_path(projected, tokens)
+    return projected
+
+
+def _path_tokens(path: str) -> list[str | int]:
+    return [int(index) if index else name for name, index in re.findall(r"\.([A-Za-z_]\w*)|\[(\d+)\]", path)]
+
+
+def _read_path(value: Any, tokens: list[str | int]) -> tuple[bool, Any]:
+    current = value
+    for token in tokens:
+        try:
+            current = current[token]
+        except (KeyError, IndexError, TypeError):
+            return False, None
+    return True, current
+
+
+def _path_exists(value: Any, tokens: list[str | int]) -> bool:
+    return _read_path(value, tokens)[0]
+
+
+def _delete_path(value: Any, tokens: list[str | int]) -> None:
+    current = value
+    for token in tokens[:-1]:
+        current = current[token]
+    last = tokens[-1]
+    if isinstance(current, dict):
+        current.pop(last, None)
+
+
+def _write_path(value: Any, tokens: list[str | int], replacement: Any) -> None:
+    current = value
+    for token in tokens[:-1]:
+        current = current[token]
+    current[tokens[-1]] = replacement
 
 
 def _validation_error_paths(error: str) -> set[str]:

@@ -1,0 +1,17 @@
+{
+  "task_id": "csv_tool_video",
+  "category": "feature_and_robustness",
+  "description": "修复 CSV 中缺失或非法 age 导致批处理失败的问题，并新增 --min-age N 筛选功能。异常记录不能影响其他合法记录，且未使用筛选参数时保持原有正常行为。",
+  "initial_commit": "AUTO_DETERMINISTIC",
+  "critical_criteria": [
+    "缺失 age 不导致整个批处理崩溃",
+    "非法 age 不影响其他合法记录",
+    "--min-age N 正确过滤",
+    "不使用 --min-age 时原有正常输入行为保持不变",
+    "csv_tool.py 保持可编译"
+  ],
+  "noncritical_criteria": [],
+  "expected_files": ["csv_tool.py"],
+  "hidden_test_command": ["{python}", "hidden_tests/check.py", "{workspace}"],
+  "notes": "Two-minute video task. Agent-visible checks are generated separately; hidden_tests is never copied into the workspace."
+}
