@@ -3,7 +3,8 @@ import json
 import unittest
 from pathlib import Path
 
-from coding_agent import WorkspaceTools, _repair_plan, run_planning
+from agent_state import AgentState
+from coding_agent import WorkspaceTools, _repair_plan, _validate_plan, run_planning
 from context_manager import ContextManager
 from planning_schema import PlanningSchemaError
 
@@ -29,6 +30,8 @@ def valid_plan():
             "step_kind": "IMPLEMENT",
             "suggested_tools": ["read_file", "apply_patch", "run_command"],
             "related_acceptance_criteria": ["AC-1"],
+            "expected_change_files": ["calculator.py"],
+            "related_verification_ids": [],
         }],
         "clarification_needed": None,
     }
@@ -92,6 +95,8 @@ class FakePlanningClient:
                                 "step_kind": "IMPLEMENT",
                                 "suggested_tools": ["read_file", "apply_patch", "run_command"],
                                 "related_acceptance_criteria": ["AC-1"],
+                                "expected_change_files": ["calculator.py"],
+                                "related_verification_ids": [],
                             }],
                             "clarification_needed": None,
                         }),
@@ -107,6 +112,20 @@ class FakePlanningClient:
 
 
 class PlanningTests(unittest.TestCase):
+    def test_human_verification_is_explicitly_disabled_without_resume_channel(self):
+        payload = valid_plan()
+        payload["acceptance_criteria"][0]["verification_mode"] = "HUMAN"
+        payload["verification_contract"][0]["verification_mode"] = "HUMAN"
+        payload["verification_contract"][0]["command"] = None
+        with self.assertRaisesRegex(PlanningSchemaError, "HUMAN verification is disabled"):
+            _validate_plan(payload, AgentState("human-only plan"))
+        client = SequenceClient([submit_response(payload)])
+        with self.assertRaisesRegex(RuntimeError, "HUMAN verification is disabled"):
+            run_planning(
+                "human-only plan", WorkspaceTools(Path(__file__).parent / "demo_project"), client, 1,
+            )
+        self.assertEqual(len(client.messages), 1)
+
     def test_planning_creates_structured_state_and_failed_baseline(self):
         root = Path(__file__).parent / "demo_project"
         client = FakePlanningClient()

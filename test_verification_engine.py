@@ -115,7 +115,7 @@ class VerificationEngineTests(unittest.TestCase):
         state.execution_plan = [ExecutionStep("S1", "implement fix", "IMPLEMENT", [], ["AC_TARGET"])]
         state.completed_steps = ["S1"]
         state.current_step = None
-        state.set_phase(EXECUTING)
+        AgentOrchestrator().transition(state, AgentEvent("INCREMENTAL_VERIFIED", "fixture enters execution"))
 
     def test_completed_plan_automatically_runs_final_verification_before_model(self):
         criteria = [criterion("AC_TARGET", "CRITICAL", "AUTO", "TARGET")]
@@ -138,7 +138,7 @@ class VerificationEngineTests(unittest.TestCase):
         state = make_state(criteria, [check("target", "TARGET", "AC_TARGET")])
         state.execution_plan = [ExecutionStep("S1", "implement fix", "IMPLEMENT", [], ["AC_TARGET"])]
         state.current_step = "S1"
-        state.set_phase(EXECUTING)
+        AgentOrchestrator().transition(state, AgentEvent("INCREMENTAL_VERIFIED", "fixture enters execution"))
         client = CountingNoToolClient()
 
         run_execution(state, tools, client, max_steps=1)
@@ -183,7 +183,7 @@ class VerificationEngineTests(unittest.TestCase):
             checks = [check("target", "TARGET", "AC_TARGET")]
             tools = FakeTools({"target": [observation(False)]}, directory)
             state = make_state(criteria, checks)
-            state.set_phase(EXECUTING)
+            AgentOrchestrator().transition(state, AgentEvent("INCREMENTAL_VERIFIED", "fixture enters execution"))
 
             report = run_execution(state, tools, FinishClient(), max_steps=1)
 
@@ -310,6 +310,8 @@ class VerificationEngineTests(unittest.TestCase):
 
         self.assertEqual(result["overall_status"], UNVERIFIED)
         self.assertEqual(result["unverified_critical"], ["AC_HUMAN"])
+        self.assertEqual(result["overall_reason"], "HUMAN_EVIDENCE_REQUIRED")
+        self.assertEqual(result["unverified_reasons"][0]["criterion_id"], "AC_HUMAN")
         self.assertEqual(state.current_phase, VERIFYING)
         self.assertTrue(transition.needs_user_confirmation)
         self.assertEqual(tools.checkpoint_manager.stable_calls, 0)
@@ -330,6 +332,7 @@ class VerificationEngineTests(unittest.TestCase):
 
         self.assertEqual(result["overall_status"], UNVERIFIED)
         self.assertEqual(result["failed_critical"], ["AC_TARGET"])
+        self.assertEqual(result["overall_reason"], "CRITICAL_CRITERION_FAILED")
         self.assertEqual(state.current_phase, DEBUGGING)
         self.assertEqual(tools.checkpoint_manager.undo_calls, 0)
         self.assertEqual(tools.checkpoint_manager.rollback_calls, 0)

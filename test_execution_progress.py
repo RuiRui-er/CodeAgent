@@ -38,9 +38,9 @@ class ExecutionProgressTests(unittest.TestCase):
                 check("V_TARGET", ["AC_VERIFY"]),
             ],
             execution_plan=[
-                ExecutionStep("STEP_1", "run baseline", "VERIFY", ["run_command"], ["AC_IMPL"]),
-                ExecutionStep("STEP_2", "modify parser", "IMPLEMENT", ["read_file"], ["AC_IMPL"]),
-                ExecutionStep("STEP_3", "run target checks", "VERIFY", ["run_command"], ["AC_VERIFY"]),
+                ExecutionStep("STEP_1", "run baseline", "VERIFY", ["run_command"], ["AC_IMPL"], [], ["V_BASE"]),
+                ExecutionStep("STEP_2", "modify parser", "IMPLEMENT", ["apply_patch"], ["AC_IMPL"], ["calculator.py"], []),
+                ExecutionStep("STEP_3", "run target checks", "VERIFY", ["run_command"], ["AC_VERIFY"], [], ["V_TARGET"]),
             ],
             current_step="STEP_1",
         )
@@ -106,6 +106,16 @@ class ExecutionProgressTests(unittest.TestCase):
         _record_tool_event(state, "run_command", {"command": ["pytest"]}, result, [], False)
         self.assertEqual(state.current_step, "STEP_2")
         self.assertNotIn("STEP_2", state.completed_steps)
+
+    def test_verify_step_requires_its_bound_check_command(self):
+        state = self.make_state()
+        state.completed_steps = ["STEP_1", "STEP_2"]
+        state.current_step = "STEP_3"
+        result = {"status": "SUCCESS", "exit_code": 0, "stdout": "ok", "stderr": ""}
+        _record_tool_event(state, "run_command", {"command": ["unrelated"]}, result, [], False)
+        self.assertEqual(state.current_step, "STEP_3")
+        _record_tool_event(state, "run_command", {"command": ["verify"]}, result, [], False)
+        self.assertIsNone(state.current_step)
 
     def test_inspect_kind_completes_after_successful_read(self):
         state = self.make_state()

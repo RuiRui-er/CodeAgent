@@ -277,6 +277,14 @@ class ToolExecutor:
             start=resolved.start,
             context_before=latest[max(0, resolved.start - 120):resolved.start],
             context_after=latest[resolved.end:resolved.end + 120],
+            related_acceptance_criteria=(
+                list(state.current_execution_step().related_acceptance_criteria)
+                if state.current_execution_step() else []
+            ),
+            related_verification_ids=(
+                list(state.current_execution_step().related_verification_ids)
+                if state.current_execution_step() else []
+            ),
         )
         change_data = change.to_dict()
         state.change_sets.append(change_data)

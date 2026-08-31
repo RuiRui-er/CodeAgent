@@ -12,7 +12,6 @@ from agent_events import (
     TOOL_FAILED,
     VERIFICATION_REGRESSED,
     VERIFICATION_UNVERIFIED,
-    USER_CONFIRMED,
     AgentEvent,
 )
 from agent_orchestrator import ALLOWED_TRANSITIONS, AgentOrchestrator
@@ -69,8 +68,13 @@ class AgentOrchestratorTests(unittest.TestCase):
         self.assertEqual(transition.next_phase, VERIFYING)
         self.assertTrue(transition.pause_autonomous_loop)
         self.assertTrue(unverified.needs_user_confirmation)
-        with self.assertRaisesRegex(ValueError, "illegal transition"):
-            self.orchestrator.transition(unverified, AgentEvent(USER_CONFIRMED, "confirmation without evidence"))
+
+    def test_phase_cannot_be_written_outside_orchestrator(self):
+        state = self.state()
+        with self.assertRaisesRegex(AttributeError, "lifecycle-owned"):
+            state.current_phase = EXECUTING
+        self.orchestrator.transition(state, AgentEvent(PLAN_READY, "plan available"))
+        self.assertEqual(state.current_phase, EXECUTING)
 
     def test_repeated_failure_replans_and_final_partial_can_done(self):
         state = self.state(EXECUTING)

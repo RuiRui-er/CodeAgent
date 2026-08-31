@@ -7,7 +7,8 @@ from pathlib import Path
 from agent_state import DEBUGGING, EXECUTING, FAILED, PLANNING, AcceptanceCriterion, AgentState, ExecutionStep
 from agent_events import REPLAN_REQUIRED, TOOL_FAILED, AgentEvent
 from agent_orchestrator import AgentOrchestrator
-from coding_agent import _transition_tool_result, run_replanning
+from coding_agent import _transition_tool_result, _validate_replan, run_replanning
+from planning_schema import PlanningSchemaError
 from context_manager import ContextManager
 from failure_classifier import FailureClassifier
 from failure_memory import FailureMemory
@@ -70,6 +71,8 @@ class ReplanClient:
                     "step_kind": "IMPLEMENT",
                     "suggested_tools": ["read_file", "apply_patch"],
                     "related_acceptance_criteria": ["AC1"],
+                    "expected_change_files": ["parser.py"],
+                    "related_verification_ids": [],
                 }]
             })}}]},
         ])
@@ -87,6 +90,19 @@ class FailureRecoveryTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.base)
+
+    def test_replan_reuses_full_schema_validation(self):
+        state = state_for_failure()
+        payload = {
+            "execution_plan": [{
+                "step_id": "R1", "description": "fix parser", "step_kind": "IMPLEMENT",
+                "suggested_tools": ["apply_patch"], "related_acceptance_criteria": ["AC1"],
+                "expected_change_files": ["parser.py"], "related_verification_ids": [],
+                "unexpected": "schema drift",
+            }]
+        }
+        with self.assertRaisesRegex(PlanningSchemaError, "unexpected field"):
+            _validate_replan(payload, state)
 
     def test_classifier_keeps_raw_streams_and_coarse_types(self):
         classifier = FailureClassifier()
@@ -182,7 +198,6 @@ class FailureRecoveryTests(unittest.TestCase):
         self.assertEqual(state.no_progress_replan_count, 2)
         self.assertEqual(state.no_progress_fingerprint, last_record["fingerprint"])
 
-        state.current_phase = EXECUTING
         transition = _transition_tool_result(
             state, "run_command", failure_result, last_record, AgentOrchestrator(),
         )

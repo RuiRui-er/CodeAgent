@@ -13,6 +13,8 @@ from agent_state import (
     VerificationCheck,
 )
 from context_manager import ContextManager
+from agent_events import FINISH_REQUESTED, PLAN_READY, TOOL_FAILED, AgentEvent
+from agent_orchestrator import AgentOrchestrator
 
 
 def main() -> None:
@@ -27,7 +29,7 @@ def main() -> None:
     ]
     state.execution_plan = [
         ExecutionStep("STEP-1", "Inspect divide", "INSPECT", ["read_file"], ["AC-1"]),
-        ExecutionStep("STEP-2", "Fix and test divide", "IMPLEMENT", ["apply_patch", "run_command"], ["AC-1"]),
+        ExecutionStep("STEP-2", "Fix and test divide", "IMPLEMENT", ["apply_patch", "run_command"], ["AC-1"], ["calculator.py"], []),
     ]
     state.current_step = "STEP-1"
 
@@ -37,21 +39,22 @@ def main() -> None:
     manager.build_messages(state, "Planning prompt")
 
     print("\n=== DEMO 2: executing current step ===")
-    state.set_phase(EXECUTING)
+    orchestrator = AgentOrchestrator()
+    orchestrator.transition(state, AgentEvent(PLAN_READY, "demo plan ready"))
     state.add_relevant_file("calculator.py")
     state.add_relevant_symbol("divide")
     state.add_action({"tool": "read_file", "observation": "calculator.py read from disk"})
     manager.build_messages(state, "Execution prompt")
 
     print("\n=== DEMO 3: verification failure ===")
-    state.set_phase(DEBUGGING)
+    orchestrator.transition(state, AgentEvent(TOOL_FAILED, "demo verification failed"))
     state.failed_attempts.append({"attempt": "python -m unittest -v", "reason": "divide returned 0.2"})
     state.failure_evidence.append({"exit_code": 1, "stderr": "AssertionError: 0.2 != 5"})
     state.add_action({"tool": "run_command", "observation": {"exit_code": 1}})
     manager.build_messages(state, "Debugging prompt")
 
     print("\n=== DEMO 4: verification success ===")
-    state.set_phase(VERIFYING)
+    orchestrator.transition(state, AgentEvent(FINISH_REQUESTED, "demo fix ready"))
     state.add_fact("Updated calculator.py in the workspace.")
     state.completed_steps.extend(["STEP-1", "STEP-2"])
     state.add_action({"tool": "run_command", "observation": {"exit_code": 0, "stdout": "OK"}})

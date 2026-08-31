@@ -44,6 +44,8 @@ class ExecutionStep:
     step_kind: str
     suggested_tools: list[str]
     related_acceptance_criteria: list[str]
+    expected_change_files: list[str] = field(default_factory=list)
+    related_verification_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -93,10 +95,10 @@ class AgentState:
     def planning_snapshot(self) -> dict[str, Any]:
         return asdict(self)
 
-    def set_phase(self, phase: str) -> None:
-        if phase not in PHASES:
-            raise ValueError(f"unknown phase: {phase}")
-        self.current_phase = phase
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "current_phase" and "current_phase" in self.__dict__:
+            raise AttributeError("current_phase is lifecycle-owned; use AgentOrchestrator.transition()")
+        super().__setattr__(name, value)
 
     def add_fact(self, fact: str) -> None:
         if fact and fact not in self.confirmed_facts:

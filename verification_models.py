@@ -55,6 +55,8 @@ class VerificationResult:
     failed_critical: list[str]
     manual_items: list[str]
     evidence_summary: str
+    overall_reason: str = ""
+    unverified_reasons: list[dict[str, Any]] = field(default_factory=list)
     human_evidence: list[dict[str, Any]] = field(default_factory=list)
     recovery_result: dict[str, Any] | None = None
     checkpoint_result: dict[str, Any] | None = None

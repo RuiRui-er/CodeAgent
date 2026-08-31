@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -82,6 +82,8 @@ class ChangeSet:
     start: int
     context_before: str
     context_after: str
+    related_acceptance_criteria: list[str] = field(default_factory=list)
+    related_verification_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

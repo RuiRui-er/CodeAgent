@@ -25,7 +25,7 @@ def main() -> None:
         tools.call(state, "apply_patch", {"path": "calculator.py", "old_text": "x", "new_text": "y"}),
     )
 
-    state.set_phase(EXECUTING)
+    AgentOrchestrator().transition(state, AgentEvent("PLAN_READY", "demo plan ready"))
     show("EXECUTING safe command succeeds", tools.call(state, "run_command", {"command": [sys.executable, "--version"]}))
     show("CONFIRM command is rejected by user", tools.call(state, "run_command", {"command": ["git", "clean", "-fd"]}))
     show("DENY command is rejected", tools.call(state, "run_command", {"command": ["shutdown", "/s"]}))

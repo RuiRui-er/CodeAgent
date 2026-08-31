@@ -22,7 +22,7 @@ class ToolSafetyTests(unittest.TestCase):
         blocked = self.tools.call(state, "apply_patch", {"path": "calculator.py", "old_text": "x", "new_text": "y"})
         self.assertEqual(blocked["status"], "BLOCKED")
 
-        state.set_phase(EXECUTING)
+        AgentOrchestrator().transition(state, AgentEvent("PLAN_READY", "test plan"))
         finish = self.tools.call(state, "finish", {"summary": "ready"})
         self.assertEqual(finish["done"], False)
         self.assertEqual(state.current_phase, EXECUTING)

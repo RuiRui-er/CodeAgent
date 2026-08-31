@@ -36,7 +36,10 @@ def make_state() -> AgentState:
     state.acceptance_criteria = [
         AcceptanceCriterion("AC1", "empty input parses", "CRITICAL", "AUTO", "TARGET", "frozen parser test")
     ]
-state.execution_plan = [ExecutionStep("STEP1", "fix parser", "IMPLEMENT", ["apply_patch", "run_command"], ["AC1"])]
+    state.execution_plan = [ExecutionStep(
+        "STEP1", "fix parser", "IMPLEMENT", ["apply_patch", "run_command"],
+        ["AC1"], ["parser.py"], [],
+    )]
     state.current_step = "STEP1"
     return state
 
@@ -91,7 +94,6 @@ def main() -> None:
             "file": "parser.py", "operation": "replace", "intent": "return token",
             "symbol": "parse", "old_block": "return []", "new_block": "return ['x']",
         }
-        state.set_phase(EXECUTING)
         state.failure_history.append({
             "id": "failure_0099", "type": "TEST_FAILED",
             "action_signature": classifier.edit_action_signature(edit),

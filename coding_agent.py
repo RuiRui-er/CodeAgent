@@ -92,6 +92,11 @@ Classify every execution step explicitly as INSPECT, IMPLEMENT, or VERIFY. The
 step_kind describes semantics; suggested_tools are recommendations only.
 Freeze target cases, expected behavior, and commands now; they must not be regenerated
 after implementation. Prefer cheap sanity evidence before target and regression checks.
+For every IMPLEMENT step, set expected_change_files to the exact workspace files that
+may produce its ChangeSets. For every VERIFY step, set related_verification_ids to the
+exact frozen checks whose commands complete that step. Use an empty list for fields not
+applicable to a step. HUMAN verification is disabled in this CLI because confirmation
+cannot yet resume the same AgentState; express only criteria with executable AUTO evidence.
 Do not propose multiple agents, RAG, or UI.
 """
 
@@ -168,8 +173,10 @@ SUBMIT_PLAN_SCHEMA = {
                             "step_kind": {"type": "string", "enum": ["INSPECT", "IMPLEMENT", "VERIFY"]},
                             "suggested_tools": {"type": "array", "items": {"type": "string"}},
                             "related_acceptance_criteria": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                            "expected_change_files": {"type": "array", "items": {"type": "string"}},
+                            "related_verification_ids": {"type": "array", "items": {"type": "string"}},
                         },
-                        "required": ["step_id", "description", "step_kind", "suggested_tools", "related_acceptance_criteria"],
+                        "required": ["step_id", "description", "step_kind", "suggested_tools", "related_acceptance_criteria", "expected_change_files", "related_verification_ids"],
                         "additionalProperties": False,
                     },
                 },
@@ -303,6 +310,11 @@ def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
         for index, item in enumerate(raw_criteria):
             if not isinstance(item, dict):
                 continue
+            if item.get("verification_mode") == "HUMAN":
+                validation_errors.append(
+                    f"$.acceptance_criteria[{index}].verification_mode: HUMAN verification is disabled "
+                    "because the current CLI has no resumable confirmation channel; use an AUTO criterion"
+                )
             method = item.get("verification_method")
             if isinstance(method, str) and not _specific_verification_method(method):
                 validation_errors.append(
@@ -340,12 +352,19 @@ def _validate_plan(payload: dict[str, Any], state: AgentState) -> AgentState:
     if len(step_ids) != len(set(step_ids)):
         raise ValueError("execution step IDs must be unique")
     known = set(criterion_ids)
+    known_checks = set(check_ids)
     for check in checks:
         if not set(check.related_acceptance_criteria) <= known:
             raise ValueError(f"verification check {check.id} refers to an unknown criterion")
     for step in steps:
         if not set(step.related_acceptance_criteria) <= known:
             raise ValueError(f"execution step {step.step_id} refers to an unknown criterion")
+        if not set(step.related_verification_ids) <= known_checks:
+            raise ValueError(f"execution step {step.step_id} refers to an unknown verification check")
+        if step.step_kind == "IMPLEMENT" and not step.expected_change_files:
+            raise ValueError(f"execution step {step.step_id} must bind IMPLEMENT work to expected_change_files")
+        if step.step_kind == "VERIFY" and not step.related_verification_ids:
+            raise ValueError(f"execution step {step.step_id} must bind VERIFY work to related_verification_ids")
     verified_criteria = {
         criterion_id
         for check in checks
@@ -530,11 +549,15 @@ def _record_tool_event(
         if result.get("symbol"):
             state.add_relevant_symbol(str(result["symbol"]))
         step = state.current_execution_step()
-        if step and step.step_kind == "IMPLEMENT":
+        if (
+            step and step.step_kind == "IMPLEMENT"
+            and path in step.expected_change_files
+            and result.get("change_set", {}).get("step_id") == step.step_id
+        ):
             state.complete_current_step()
     elif name == "run_command" and succeeded and state.current_phase == EXECUTING:
         step = state.current_execution_step()
-        if step and step.step_kind == "VERIFY":
+        if step and step.step_kind == "VERIFY" and _matches_step_verification(state, step, arguments):
             state.complete_current_step()
     elif name == "list_dir" and succeeded and state.current_phase == EXECUTING:
         step = state.current_execution_step()
@@ -546,16 +569,41 @@ def _record_tool_event(
     return None
 
 
+def _matches_step_verification(
+    state: AgentState, step: ExecutionStep, arguments: dict[str, Any],
+) -> bool:
+    command = arguments.get("command")
+    requested = command if isinstance(command, list) else [str(command)]
+    return any(
+        check.id in step.related_verification_ids
+        and check.command is not None
+        and requested == check.command
+        for check in state.verification_contract
+    )
+
+
 def _validate_replan(payload: dict[str, Any], state: AgentState) -> None:
+    validate_schema(payload, SUBMIT_REPLAN_SCHEMA["function"]["parameters"])
     steps = [ExecutionStep(**item) for item in payload["execution_plan"]]
     if not steps:
         raise ValueError("revised execution plan cannot be empty")
     known = {item.id for item in state.acceptance_criteria}
+    known_checks = {item.id for item in state.verification_contract}
+    step_ids = [item.step_id for item in steps]
+    if len(step_ids) != len(set(step_ids)):
+        raise ValueError("revised execution step IDs must be unique")
     covered = {criterion for step in steps for criterion in step.related_acceptance_criteria}
     if any(not set(step.related_acceptance_criteria) <= known for step in steps):
         raise ValueError("revised plan refers to an unknown frozen criterion")
     if covered != known:
         raise ValueError("revised plan must still cover every frozen acceptance criterion")
+    for step in steps:
+        if not set(step.related_verification_ids) <= known_checks:
+            raise ValueError(f"revised step {step.step_id} refers to an unknown verification check")
+        if step.step_kind == "IMPLEMENT" and not step.expected_change_files:
+            raise ValueError(f"revised step {step.step_id} must bind IMPLEMENT work to expected_change_files")
+        if step.step_kind == "VERIFY" and not step.related_verification_ids:
+            raise ValueError(f"revised step {step.step_id} must bind VERIFY work to related_verification_ids")
     state.execution_plan = steps
     state.current_step = steps[0].step_id
 
@@ -620,17 +668,11 @@ def _complete_successful_baseline_steps(state: AgentState) -> None:
         for item in state.baseline
         if item.get("observation", {}).get("status") == "SUCCESS"
     }
-    covered_criteria = {
-        criterion
-        for check in state.verification_contract
-        if check.id in successful_ids
-        for criterion in check.related_acceptance_criteria
-    }
     while True:
         step = state.current_execution_step()
         if not step or step.step_kind != "VERIFY":
             return
-        if not set(step.related_acceptance_criteria) <= covered_criteria:
+        if not step.related_verification_ids or not set(step.related_verification_ids) <= successful_ids:
             return
         state.complete_current_step()
 
@@ -694,6 +736,8 @@ def run_planning(
                     return state
                 except (KeyError, TypeError, ValueError, PlanningSchemaError) as exc:
                     state.planning_validation_failures += 1
+                    if "HUMAN verification is disabled" in str(exc):
+                        raise RuntimeError(str(exc)) from exc
                     state = _repair_plan(arguments, str(exc), state, client, context_manager)
                     if not state.clarification_needed:
                         _capture_baseline(state, tools)
@@ -769,7 +813,7 @@ files as the only source of truth for current code.
         if not tool_calls:
             content = message.get("content") or "Model returned no tool call."
             if state.current_phase == VERIFYING:
-                final = f"Verification phase reached (final verification status is not implemented yet): {content}"
+                final = f"Verification phase produced no executable evidence action: {content}"
                 log("AGENT STOPPED", final)
                 return final
             state.add_action({
@@ -835,7 +879,7 @@ def _request_final_verification(
         return final
     if transition.pause_autonomous_loop:
         final = _verification_report(verification)
-        log("HUMAN CONFIRMATION REQUIRED", final)
+        log("AUTONOMOUS VERIFICATION PAUSED", final)
         return final
     return None
 
@@ -933,6 +977,8 @@ def _pause_summary(state: AgentState) -> str:
 
 def _verification_report(result: dict[str, Any]) -> str:
     lines = [f"Verification: {result['overall_status']}", result["evidence_summary"]]
+    if result.get("overall_reason"):
+        lines.append(f"Reason: {result['overall_reason']}")
     if result.get("manual_items"):
         lines.append("Manual confirmation: " + ", ".join(result["manual_items"]))
     if result.get("failed_critical"):

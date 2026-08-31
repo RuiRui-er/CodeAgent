@@ -15,6 +15,14 @@ FINAL = "FINAL"
 INCREMENTAL = "INCREMENTAL"
 EVIDENCE_ORDER = {"SANITY": 0, "TARGET": 1, "REGRESSION": 2}
 
+NEW_REGRESSION = "NEW_REGRESSION"
+CRITICAL_CRITERION_FAILED = "CRITICAL_CRITERION_FAILED"
+CRITICAL_EVIDENCE_MISSING = "CRITICAL_EVIDENCE_MISSING"
+HUMAN_EVIDENCE_REQUIRED = "HUMAN_EVIDENCE_REQUIRED"
+SANITY_CHECK_FAILED = "SANITY_CHECK_FAILED"
+NONCRITICAL_AUTO_FAILED = "NONCRITICAL_AUTO_FAILED"
+ALL_REQUIRED_EVIDENCE_PASSED = "ALL_REQUIRED_EVIDENCE_PASSED"
+
 
 class VerificationEngine:
     """Runs only pre-planned checks and applies discrete evidence rules."""
@@ -108,6 +116,8 @@ class VerificationEngine:
             overall = PARTIALLY_VERIFIED
         else:
             overall = VERIFIED
+        reasons = self._unverified_reasons(criteria, criterion_results)
+        overall_reason = self._overall_reason(overall, reasons)
         summary = (
             f"{len(verified_critical)} critical PASS; {len(failed_critical)} critical FAIL; "
             f"{len(unverified_critical)} critical UNVERIFIED; {len(new_failures)} new regression(s); "
@@ -122,7 +132,8 @@ class VerificationEngine:
             current_failures=cached.get("current_failures", []), new_failures=new_failures,
             verified_critical=verified_critical, unverified_critical=unverified_critical,
             failed_critical=failed_critical, manual_items=manual_items,
-            evidence_summary=summary, human_evidence=list(state.human_evidence),
+            evidence_summary=summary, overall_reason=overall_reason,
+            unverified_reasons=reasons, human_evidence=list(state.human_evidence),
         )
 
     def _run(self, state: AgentState, mode: str, selected: set[str]) -> VerificationResult:
@@ -186,6 +197,10 @@ class VerificationEngine:
             overall = PARTIALLY_VERIFIED
         else:
             overall = VERIFIED
+        criteria_by_id = {item.id: item for item in state.acceptance_criteria}
+        result_dicts = [item.to_dict() for item in criterion_results]
+        reasons = self._unverified_reasons(criteria_by_id, result_dicts)
+        overall_reason = self._overall_reason(overall, reasons)
 
         summary = (
             f"{len(verified_critical)} critical PASS; {len(failed_critical)} critical FAIL; "
@@ -195,7 +210,7 @@ class VerificationEngine:
         result = VerificationResult(
             mode=mode,
             overall_status=overall,
-            criterion_results=[item.to_dict() for item in criterion_results],
+            criterion_results=result_dicts,
             target_results=by_type("TARGET"),
             regression_results=by_type("REGRESSION"),
             sanity_results=by_type("SANITY"),
@@ -207,6 +222,8 @@ class VerificationEngine:
             failed_critical=failed_critical,
             manual_items=manual_items,
             evidence_summary=summary,
+            overall_reason=overall_reason,
+            unverified_reasons=reasons,
         )
         self._log(result)
         return result
@@ -314,6 +331,53 @@ class VerificationEngine:
             summary, details, [item.id for item, _ in observed],
             [self._command_evidence(check, item) for check, item in observed],
         )
+
+    @staticmethod
+    def _unverified_reasons(
+        criteria: dict[str, Any], criterion_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        reasons: list[dict[str, Any]] = []
+        for item in criterion_results:
+            criterion = criteria[item["criterion_id"]]
+            if item["status"] == CRITERION_UNVERIFIED:
+                code = (
+                    HUMAN_EVIDENCE_REQUIRED
+                    if criterion.verification_mode == "HUMAN"
+                    else CRITICAL_EVIDENCE_MISSING
+                )
+                reasons.append({
+                    "code": code,
+                    "criterion_id": item["criterion_id"],
+                    "criticality": criterion.criticality,
+                    "detail": item["summary"],
+                })
+            elif item["status"] == FAIL:
+                if item["evidence_type"] == "SANITY":
+                    code = SANITY_CHECK_FAILED
+                elif criterion.criticality == "CRITICAL":
+                    code = CRITICAL_CRITERION_FAILED
+                else:
+                    code = NONCRITICAL_AUTO_FAILED
+                reasons.append({
+                    "code": code,
+                    "criterion_id": item["criterion_id"],
+                    "criticality": criterion.criticality,
+                    "detail": item["summary"],
+                })
+        return reasons
+
+    @staticmethod
+    def _overall_reason(overall: str, reasons: list[dict[str, Any]]) -> str:
+        if overall == REGRESSED:
+            return NEW_REGRESSION
+        if reasons:
+            priority = (
+                CRITICAL_CRITERION_FAILED, CRITICAL_EVIDENCE_MISSING,
+                HUMAN_EVIDENCE_REQUIRED, SANITY_CHECK_FAILED, NONCRITICAL_AUTO_FAILED,
+            )
+            codes = {item["code"] for item in reasons}
+            return next((code for code in priority if code in codes), reasons[0]["code"])
+        return ALL_REQUIRED_EVIDENCE_PASSED
 
     def _regression_check_passed(
         self,
