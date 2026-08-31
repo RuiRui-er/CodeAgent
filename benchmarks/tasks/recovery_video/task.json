@@ -1,9 +1,9 @@
 {
   "task_id": "recovery_video",
   "category": "deterministic_recovery_fixture",
-  "description": "Add --prefix TEXT to label_tool.py while preserving output when the option is omitted.",
+  "description": "为 label_tool.py 新增 --prefix TEXT，并保持未使用该参数时的原有输出。",
   "initial_commit": "AUTO_DETERMINISTIC",
-  "critical_criteria": ["--prefix adds TEXT before the name", "default output remains unchanged", "label_tool.py remains compilable"],
+  "critical_criteria": ["--prefix 在 name 前添加 TEXT", "默认输出保持不变", "label_tool.py 可编译"],
   "noncritical_criteria": [],
   "expected_files": ["label_tool.py"],
   "hidden_test_command": ["{python}", "hidden_tests/check.py", "{workspace}"],

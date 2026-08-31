@@ -22,19 +22,40 @@ class RichConsoleRenderer:
         self.console = console or Console(file=sys.__stdout__, highlight=False)
 
     def header(self, state: Any) -> None:
-        completed = len(state.completed_steps)
-        total = len(state.execution_plan)
+        action_steps = [step for step in state.execution_plan if step.step_kind != "VERIFY"]
+        total = len(action_steps)
+        action_ids = {step.step_id for step in action_steps}
+        completed = len(action_ids.intersection(state.completed_steps))
         verification = (state.verification_result or {}).get("overall_status", "PENDING")
         current = state.current_execution_step()
-        if (
-            current and current.step_kind == "VERIFY" and verification == "VERIFIED"
-            and current.step_id not in state.completed_steps
-        ):
-            completed += 1
+        # The core briefly remains in EXECUTING after the last implementation
+        # step advances the cursor to a VERIFY step. VERIFYING is rendered on
+        # the immediately following phase transition, so suppress this duplicate
+        # presentation-only snapshot without changing AgentState.
+        if state.current_phase == "EXECUTING" and current is not None and current.step_kind == "VERIFY":
+            return
+        if state.current_phase == "PLANNING":
+            step_number = 0
+            step_label = "未开始"
+        elif state.current_phase == "DONE":
+            step_number = total
+            step_label = "已完成"
+        elif state.current_phase == "VERIFYING" or (current is not None and current.step_kind == "VERIFY"):
+            step_number = total
+            step_label = "修改完成"
+        elif current is not None and current.step_id in action_ids:
+            step_number = next(
+                index for index, item in enumerate(action_steps, 1)
+                if item.step_id == current.step_id
+            )
+            step_label = current.step_id
+        else:
+            step_number = min(completed, total)
+            step_label = "等待迁移"
         body = Text()
         body.append("阶段: ", style="dim")
         body.append(state.current_phase, style="bold blue")
-        body.append(f"      计划: {completed}/{total}", style="white")
+        body.append(f"      执行: {step_number}/{total} · {step_label}", style="white")
         body.append("      验证: ", style="dim")
         body.append(verification, style=self._status_style(verification))
         self.console.print(Panel(body, title="Coding Agent", border_style="blue", expand=True))
@@ -50,6 +71,30 @@ class RichConsoleRenderer:
                     criterion.description,
                 )
             )
+
+        self.console.print("\n[bold blue]执行计划[/bold blue]")
+        action_count = 0
+        verification_count = 0
+        for index, step in enumerate(state.execution_plan, 1):
+            if step.step_kind == "VERIFY":
+                verification_count += 1
+                kind_style = "yellow"
+            else:
+                action_count += 1
+                kind_style = "cyan"
+            self.console.print(
+                Text.assemble(
+                    (f"{index}. ", "dim"),
+                    (step.step_id, "bold"),
+                    (f" [{step.step_kind}] ", kind_style),
+                    step.description,
+                )
+            )
+        self.console.print(
+            f"[dim]实施步骤: {action_count} · 验证步骤: {verification_count}；"
+            "顶部“执行”进度只统计实施步骤。[/dim]"
+        )
+
         self.console.print("\n[green]✓[/green] Verification Contract [bold]已冻结[/bold]")
         self.console.print("[dim]最小输入与断言均已在修改前固定；hidden evaluator 不在 workspace 中。[/dim]")
 
@@ -136,6 +181,28 @@ class RichConsoleRenderer:
             checkpoint = (result.get("checkpoint") or {}).get("id", "—")
             self.console.print(f"[green]✓[/green] Stable Checkpoint {checkpoint} {status}")
 
+    def debugging_evidence(
+        self,
+        failure: dict[str, Any] | None,
+        check_id: str,
+        baseline: dict[str, Any] | None,
+        current: dict[str, Any] | None,
+    ) -> None:
+        """Render selected real failure evidence without interpreting lifecycle state."""
+        failure = failure or {}
+        baseline = baseline or {}
+        current = current or {}
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="dim", width=14)
+        table.add_column()
+        table.add_row("FailureEvent", f"{failure.get('id', '—')} · {failure.get('type', '—')}")
+        table.add_row("Fingerprint", str(failure.get("fingerprint") or "—"))
+        table.add_row("失败检查", check_id)
+        table.add_row("Baseline", self._observation_summary(baseline))
+        table.add_row("Current", self._observation_summary(current))
+        table.add_row("相关 ChangeSet", str(failure.get("related_changeset") or "—"))
+        self.console.print(Panel(table, title="DEBUGGING 证据", border_style="red", expand=False))
+
     def transition(self, transition: Any) -> None:
         if transition.previous_phase == transition.next_phase and transition.event == "EDIT_APPLIED":
             return
@@ -144,15 +211,6 @@ class RichConsoleRenderer:
             f"{transition.previous_phase} [dim]-- {transition.event} -->[/dim] "
             f"[bold]{transition.next_phase}[/bold]"
         )
-
-    def decision_summary(self, current_step: str, evidence: str, next_action: str) -> None:
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="dim")
-        table.add_column()
-        table.add_row("当前步骤", current_step)
-        table.add_row("依据", evidence)
-        table.add_row("下一动作", next_action)
-        self.console.print(Panel(table, title="决策摘要", border_style="yellow", expand=False))
 
     def checkpoint(self, result: dict[str, Any] | None) -> None:
         if not result:
@@ -195,3 +253,10 @@ class RichConsoleRenderer:
         selected = interesting[:2] or lines[:2]
         text = " | ".join(selected)
         return text if len(text) <= 120 else text[:117] + "..."
+
+    @staticmethod
+    def _observation_summary(observation: dict[str, Any]) -> str:
+        passed = RichConsoleRenderer._passed(observation)
+        stdout = str(observation.get("stdout") or "").strip()
+        value = stdout.splitlines()[-1] if stdout else "(无输出)"
+        return f"{'PASS' if passed else 'FAIL'} · stdout: {value}"

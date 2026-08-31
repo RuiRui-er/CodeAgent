@@ -17,7 +17,7 @@ CSV_TASK = (
     "异常记录不能影响其他合法记录，且未使用筛选参数时保持原有正常行为。"
 )
 
-RECOVERY_TASK = "Add --prefix TEXT to label_tool.py while preserving output when the option is omitted."
+RECOVERY_TASK = "为 label_tool.py 新增 --prefix TEXT，并保持未使用该参数时的原有输出。"
 
 
 class ScriptedClient:
@@ -60,13 +60,13 @@ def csv_plan() -> dict[str, Any]:
         "verification_contract": checks,
         "execution_plan": [
             {
-                "step_id": "STEP_INSPECT", "description": "Inspect csv_tool.py before editing",
-                "step_kind": "INSPECT", "suggested_tools": ["read_file"],
-                "related_acceptance_criteria": all_ids,
-                "expected_change_files": [], "related_verification_ids": [],
+                "step_id": "STEP_PARSE", "description": "修改 parse_row：缺失或非法 age 时返回 None",
+                "step_kind": "IMPLEMENT", "suggested_tools": ["apply_patch"],
+                "related_acceptance_criteria": ["AC_EMPTY", "AC_INVALID"],
+                "expected_change_files": ["csv_tool.py"], "related_verification_ids": [],
             },
             {
-                "step_id": "STEP_IMPLEMENT", "description": "修改 csv_tool.py：逐行跳过缺失或非法 age，并新增可选的 --min-age 筛选",
+                "step_id": "STEP_MAIN", "description": "修改 main：跳过异常记录，增加 --min-age，并保持默认输出",
                 "step_kind": "IMPLEMENT", "suggested_tools": ["apply_patch"],
                 "related_acceptance_criteria": ["AC_EMPTY", "AC_INVALID", "AC_MIN_AGE", "AC_DEFAULT"],
                 "expected_change_files": ["csv_tool.py"], "related_verification_ids": [],
@@ -120,6 +120,15 @@ def csv_planning_client() -> ScriptedClient:
 
 
 def csv_execution_client() -> ScriptedClient:
+    parse_before = '''def parse_row(row: dict[str, str]) -> tuple[str, int]:
+    return row["name"], int(row["age"])
+'''
+    parse_after = '''def parse_row(row: dict[str, str]) -> tuple[str, int] | None:
+    try:
+        return row["name"], int(row["age"])
+    except (KeyError, TypeError, ValueError):
+        return None
+'''
     main_before = '''def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("csv_file")
@@ -131,7 +140,7 @@ def csv_execution_client() -> ScriptedClient:
             print(f"{name},{age}")
     return 0
 '''
-    main_after = '''def main() -> int:
+    main_filtered = '''def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("csv_file")
     parser.add_argument("--min-age", type=int)
@@ -139,10 +148,10 @@ def csv_execution_client() -> ScriptedClient:
 
     with Path(args.csv_file).open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
-            try:
-                name, age = parse_row(row)
-            except (KeyError, TypeError, ValueError):
+            parsed = parse_row(row)
+            if parsed is None:
                 continue
+            name, age = parsed
             if args.min_age is None or age >= args.min_age:
                 print(f"{name},{age}")
     return 0
@@ -151,32 +160,36 @@ def csv_execution_client() -> ScriptedClient:
         tool_response("read_file", {"path": "csv_tool.py"}, "csv-read"),
         tool_response("apply_patch", {
             "file": "csv_tool.py", "operation": "replace",
-            "intent": "add optional minimum-age filtering while preserving default output", "symbol": "main",
-            "old_block": main_before, "new_block": main_after,
-        }, "csv-filter-edit"),
-        tool_response("finish", {"summary": "Implementation is ready for frozen final verification."}, "csv-finish"),
+            "intent": "return None for missing or invalid age", "symbol": "parse_row",
+            "old_block": parse_before, "new_block": parse_after,
+        }, "csv-parse-edit"),
+        tool_response("apply_patch", {
+            "file": "csv_tool.py", "operation": "replace",
+            "intent": "skip malformed rows and add optional minimum-age filtering", "symbol": "main",
+            "old_block": main_before, "new_block": main_filtered,
+        }, "csv-main-edit"),
     ])
 
 
 def recovery_plan() -> dict[str, Any]:
     checks = recovery_checks()
     criteria = [
-        _criterion("AC_PREFIX", "--prefix TEXT outputs TEXT:name", "TARGET"),
-        _criterion("AC_DEFAULT", "Without --prefix, output remains the original name", "REGRESSION"),
-        _criterion("AC_SANITY", "label_tool.py remains compilable", "SANITY"),
+        _criterion("AC_PREFIX", "使用 --prefix TEXT 时输出 TEXT:name", "TARGET"),
+        _criterion("AC_DEFAULT", "不使用 --prefix 时仍输出原始 name", "REGRESSION"),
+        _criterion("AC_SANITY", "label_tool.py 修改后仍可被 Python 编译", "SANITY"),
     ]
     all_ids = [item["id"] for item in criteria]
     return {
-        "task_understanding": "Add an optional prefix without changing default output.",
+        "task_understanding": "新增可选的 --prefix，同时保持默认输出不变。",
         "acceptance_criteria": criteria,
         "verification_contract": checks,
         "execution_plan": [{
-            "step_id": "STEP_IMPLEMENT", "description": "Add the optional --prefix behavior",
+            "step_id": "STEP_IMPLEMENT", "description": "新增可选的 --prefix 行为并保持默认输出",
             "step_kind": "IMPLEMENT", "suggested_tools": ["apply_patch"],
             "related_acceptance_criteria": all_ids,
             "expected_change_files": ["label_tool.py"], "related_verification_ids": [],
         }, {
-            "step_id": "STEP_VERIFY", "description": "Run frozen prefix, default, and compile checks",
+            "step_id": "STEP_VERIFY", "description": "运行冻结的 prefix、默认行为和编译检查",
             "step_kind": "VERIFY", "suggested_tools": ["run_command", "finish"],
             "related_acceptance_criteria": all_ids, "expected_change_files": [],
             "related_verification_ids": [item["id"] for item in checks],
@@ -188,7 +201,7 @@ def recovery_plan() -> dict[str, Any]:
 def recovery_checks() -> list[dict[str, Any]]:
     return [
         _check(
-            "V_SANITY", "Compile label_tool.py", "SANITY", ["AC_SANITY"],
+            "V_SANITY", "编译 label_tool.py", "SANITY", ["AC_SANITY"],
             [sys.executable, "-m", "py_compile", "label_tool.py"],
             "python -m py_compile label_tool.py must exit 0",
         ),
@@ -198,7 +211,7 @@ def recovery_checks() -> list[dict[str, Any]]:
             "Run alice --prefix VIP and require VIP:alice",
         ),
         _check(
-            "V_DEFAULT", "Default label output", "REGRESSION", ["AC_DEFAULT"],
+            "V_DEFAULT", "不带 --prefix 的默认输出", "REGRESSION", ["AC_DEFAULT"],
             _cli_command("label_tool.py", ["alice"], "alice"),
             "Run alice without --prefix and require the original output alice",
         ),
@@ -218,7 +231,8 @@ RECOVERY_MAIN_REGRESSED = '''def main() -> int:
     parser.add_argument("name")
     parser.add_argument("--prefix")
     args = parser.parse_args()
-    print(f"{args.prefix}:{args.name}")
+    prefix = args.prefix or ""
+    print(f"{prefix}:{args.name}")
     return 0
 '''
 
@@ -273,6 +287,7 @@ def _cli_command(program: str, arguments: list[str], expected: str) -> list[str]
     script = (
         "import subprocess,sys;"
         f"r=subprocess.run([sys.executable,{program!r},*{arguments!r}],capture_output=True,text=True);"
-        f"assert r.returncode==0,(r.returncode,r.stderr);assert r.stdout.strip()=={expected!r},r.stdout"
+        "actual=r.stdout.strip();print(actual);"
+        f"assert r.returncode==0,(r.returncode,r.stderr);assert actual=={expected!r},actual"
     )
     return [sys.executable, "-c", script]

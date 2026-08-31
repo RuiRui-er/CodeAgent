@@ -1020,6 +1020,9 @@ them. Execute planned pre-change verification setup before product-code changes 
 present. This stage may use all provided tools.
 The context is rebuilt from structured state before every request. Treat workspace
 files as the only source of truth for current code.
+A successful apply_patch completes the current IMPLEMENT step. Before submitting it,
+make sure the proposed ChangeSet covers every Acceptance Criterion bound to that step;
+do not submit a deliberately partial edit and assume another IMPLEMENT turn will exist.
 """
     orchestrator = orchestrator or AgentOrchestrator()
     if state.current_phase == PLANNING and state.execution_plan:
@@ -1030,6 +1033,8 @@ files as the only source of truth for current code.
     trajectory: list[dict[str, Any]] = []
     previous_progress: tuple[str | None, int] | None = None
     stagnant_execution_turns = 0
+    pending_tool_protocol_repair: dict[str, Any] | None = None
+    tool_protocol_repair_attempts = 0
 
     for step in range(1, max_steps + 1):
         if state.needs_user_confirmation:
@@ -1066,7 +1071,23 @@ files as the only source of truth for current code.
             and bool(state.change_sets)
             and (state.current_failure or {}).get("evidence", {}).get("status") == "STALE_EDIT"
         )
+        debugging_edit_converging = (
+            stagnant_execution_turns >= 2
+            and state.current_phase == DEBUGGING
+            and state.current_failure is not None
+            and len(state.recent_actions) >= 2
+            and all(action.get("tool") == "read_file" for action in state.recent_actions[-2:])
+        )
         request_prompt = execution_prompt
+        if pending_tool_protocol_repair:
+            missing = ", ".join(pending_tool_protocol_repair["missing"])
+            request_prompt += f"""
+
+Tool protocol repair: the previous {pending_tool_protocol_repair['tool']} request was
+not executed because required argument(s) were missing: {missing}. Resubmit the same
+intended tool call now with every required argument. Do not inspect files again and do
+not change the implementation merely to repair the tool-call envelope.
+"""
         if converging:
             request_prompt += """
 
@@ -1083,6 +1104,14 @@ ChangeSet is still applied. Re-reading the unchanged file is no longer diagnosti
 Call finish now so the frozen Verification Contract, rather than visual inspection,
 decides whether that applied change is sufficient. finish does not bypass verification.
 """
+        if debugging_edit_converging:
+            request_prompt += """
+
+Debugging convergence requirement: repeated read_file actions have not changed the
+failure evidence or workspace. The current file and failed frozen checks are already
+in context. Stop inspecting and call apply_patch now with a distinct corrective edit
+that addresses the failed criteria.
+"""
         messages = context_manager.build_messages(state, request_prompt)
         log(f"STEP {step}/{max_steps} - MODEL REQUEST", {"trajectory_events": len(trajectory)})
         schemas = tool_schemas_for_phase(state.current_phase)
@@ -1091,13 +1120,29 @@ decides whether that applied change is sufficient. finish does not bypass verifi
                 schema for schema in schemas
                 if schema["function"]["name"] not in {"read_file", "list_dir", "search_code"}
             ]
-        if stale_edit_converging:
+        if pending_tool_protocol_repair:
+            schemas = [
+                schema for schema in schemas
+                if schema["function"]["name"] == pending_tool_protocol_repair["tool"]
+            ]
+        elif stale_edit_converging:
             schemas = [
                 schema for schema in schemas
                 if schema["function"]["name"] == "finish"
             ]
-        if stale_edit_converging:
+        elif debugging_edit_converging:
+            schemas = [
+                schema for schema in schemas
+                if schema["function"]["name"] == "apply_patch"
+            ]
+        if pending_tool_protocol_repair:
+            message = _complete_with_required_tool(
+                client, messages, schemas, pending_tool_protocol_repair["tool"],
+            )
+        elif stale_edit_converging:
             message = _complete_with_required_tool(client, messages, schemas, "finish")
+        elif debugging_edit_converging:
+            message = _complete_with_required_tool(client, messages, schemas, "apply_patch")
         elif converging:
             message = _complete_with_required_tool(client, messages, schemas, "apply_patch")
         else:
@@ -1126,7 +1171,30 @@ decides whether that applied change is sufficient. finish does not bypass verifi
                 result = {"status": "FAILED", "tool": name, "reason": parse_error}
             else:
                 log("TOOL CALL", {"name": name, "arguments": arguments})
+                missing = _missing_tool_protocol_arguments(name, arguments)
+                if missing and tool_protocol_repair_attempts < 2:
+                    tool_protocol_repair_attempts += 1
+                    pending_tool_protocol_repair = {"tool": name, "missing": missing}
+                    result = {
+                        "status": "PROTOCOL_REPAIR_REQUIRED",
+                        "tool": name,
+                        "missing_required_arguments": missing,
+                        "reason": (
+                            "tool call was not executed; resubmit it with required argument(s): "
+                            + ", ".join(missing)
+                        ),
+                    }
+                    log("TOOL PROTOCOL REPAIR", result)
+                    state.add_action({
+                        "tool": name,
+                        "arguments": arguments,
+                        "observation": result,
+                    })
+                    trajectory.append({"tool": result})
+                    continue
                 result = tools.call(state, name, arguments)
+                pending_tool_protocol_repair = None
+                tool_protocol_repair_attempts = 0
             log("TOOL RESULT", result)
             failure = _record_tool_event(
                 state, name, arguments, result, trajectory,
@@ -1158,6 +1226,13 @@ decides whether that applied change is sufficient. finish does not bypass verifi
     final = _termination_summary(state, max_steps)
     log("AGENT STOPPED", final)
     return final
+
+
+def _missing_tool_protocol_arguments(name: str, arguments: dict[str, Any]) -> list[str]:
+    """Detect repairable tool-envelope omissions before they become lifecycle failures."""
+    if name != "apply_patch" or arguments.get("candidate_id"):
+        return []
+    return [field for field in ("file", "operation", "intent") if not arguments.get(field)]
 
 
 def _complete_baseline_owned_verify_steps(state: AgentState) -> None:

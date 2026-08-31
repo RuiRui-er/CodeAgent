@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -5,7 +6,12 @@ from unittest.mock import patch
 from agent_state import AcceptanceCriterion, AgentState, ExecutionStep, VerificationCheck, EXECUTING
 from agent_events import AgentEvent, PLAN_READY
 from agent_orchestrator import AgentOrchestrator
-from coding_agent import _capture_baseline, _record_tool_event
+from coding_agent import (
+    _capture_baseline,
+    _missing_tool_protocol_arguments,
+    _record_tool_event,
+    run_execution,
+)
 from context_manager import ContextManager
 from tool_executor import ToolExecutor
 
@@ -29,7 +35,91 @@ class SuccessfulTools:
         return {"status": "SUCCESS", "exit_code": 0, "stdout": "ok", "stderr": ""}
 
 
+class ProtocolRepairClient:
+    def __init__(self):
+        self.responses = iter([
+            self.response({
+                "file": "x.py", "operation": "replace",
+                "old_block": "old", "new_block": "new",
+            }),
+            self.response({
+                "file": "x.py", "operation": "replace", "intent": "fix x",
+                "old_block": "old", "new_block": "new",
+            }),
+        ])
+
+    @staticmethod
+    def response(arguments):
+        return {
+            "content": None,
+            "tool_calls": [{
+                "id": "call", "type": "function",
+                "function": {"name": "apply_patch", "arguments": json.dumps(arguments)},
+            }],
+        }
+
+    def complete(self, messages, tool_schemas=None, required_tool=None):
+        return next(self.responses)
+
+
+class RecordingPatchTools:
+    root = Path(__file__).parent
+
+    def __init__(self):
+        self.calls = []
+
+    def call(self, state, name, arguments):
+        self.calls.append((name, arguments))
+        change = {
+            "id": "change_0001", "file": "x.py", "symbol": None,
+            "operation": "replace", "intent": arguments["intent"],
+            "apply_status": "APPLIED", "verification_status": "UNVERIFIED",
+            "rollback_status": "NONE", "step_id": state.current_step,
+        }
+        state.change_sets.append(change)
+        return {
+            "status": "APPLIED", "file": "x.py", "operation": "replace",
+            "intent": arguments["intent"], "change_set": change,
+        }
+
+
 class ExecutionProgressTests(unittest.TestCase):
+    def test_apply_patch_protocol_requires_intent_before_tool_execution(self):
+        incomplete = {
+            "file": "csv_tool.py", "operation": "replace",
+            "old_block": "old", "new_block": "new",
+        }
+        self.assertEqual(
+            _missing_tool_protocol_arguments("apply_patch", incomplete), ["intent"],
+        )
+        incomplete["intent"] = "skip invalid rows"
+        self.assertEqual(_missing_tool_protocol_arguments("apply_patch", incomplete), [])
+        self.assertEqual(
+            _missing_tool_protocol_arguments("apply_patch", {"candidate_id": "candidate_1"}), [],
+        )
+
+    def test_missing_intent_is_repaired_without_entering_debugging(self):
+        state = AgentState(
+            "fix x", current_phase=EXECUTING,
+            acceptance_criteria=[criterion("AC")],
+            execution_plan=[
+                ExecutionStep("I", "implement", "IMPLEMENT", ["apply_patch"], ["AC"], ["x.py"], []),
+                ExecutionStep("NEXT", "inspect result", "INSPECT", ["read_file"], ["AC"]),
+            ],
+            current_step="I",
+        )
+        tools = RecordingPatchTools()
+        run_execution(state, tools, ProtocolRepairClient(), max_steps=2)
+
+        self.assertEqual(len(tools.calls), 1)
+        self.assertEqual(tools.calls[0][1]["intent"], "fix x")
+        self.assertIn("I", state.completed_steps)
+        self.assertFalse(any(item["to"] == "DEBUGGING" for item in state.phase_history))
+        self.assertTrue(any(
+            action.get("observation", {}).get("status") == "PROTOCOL_REPAIR_REQUIRED"
+            for action in state.recent_actions
+        ))
+
     def test_pre_edit_verify_step_is_consumed_when_baseline_already_exists(self):
         from coding_agent import _complete_baseline_owned_verify_steps
 

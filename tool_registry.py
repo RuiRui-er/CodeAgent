@@ -88,10 +88,7 @@ TOOLS = {
                 "new_block": {"type": "string"},
                 "candidate_id": {"type": "string"},
             },
-            "anyOf": [
-                {"required": ["file", "operation", "intent"]},
-                {"required": ["candidate_id"]},
-            ],
+            "required": ["file", "operation", "intent"],
             "additionalProperties": False,
         },
     ),

@@ -34,6 +34,7 @@ from tool_executor import ToolExecutor
 from verification_engine import VerificationEngine
 from video_demo_fixtures import (
     CSV_TASK,
+    RECOVERY_TASK,
     RECOVERY_MAIN_BEFORE,
     RECOVERY_MAIN_FIXED,
     RECOVERY_MAIN_REGRESSED,
@@ -74,6 +75,9 @@ class RenderingToolExecutor(ToolExecutor):
         self.renderer.console.print(f"[dim]{command}[/dim]")
         self.renderer.console.print(f"原因: {reason}")
         return Confirm.ask("允许执行", default=False, console=self.renderer.console)
+
+    def begin_verification_cycle(self) -> None:
+        self._rendered_verification_ids.clear()
 
     def call(self, state, name, arguments):
         result = super().call(state, name, arguments)
@@ -142,7 +146,7 @@ def run_csv_demo(
                 user_task or CSV_TASK, tools, planning_client, max_planning_steps=1,
                 required_evidence_types={"SANITY"},
                 require_all_baselines=True,
-                max_execution_plan_steps=4,
+                max_execution_plan_steps=3,
                 required_sanity_command_fragment="py_compile",
             )
             renderer.header(state)
@@ -172,7 +176,10 @@ def run_csv_demo(
     return result
 
 
-def run_recovery_demo(console: Console | None = None) -> dict[str, Any]:
+def run_recovery_demo(
+    console: Console | None = None,
+    user_task: str | None = None,
+) -> dict[str, Any]:
     """Exercise the real recovery pipeline with a deterministic regressive edit.
 
     This fixture is used because an unconstrained model cannot be guaranteed to choose
@@ -180,12 +187,14 @@ def run_recovery_demo(console: Console | None = None) -> dict[str, Any]:
     resulting tool output, evidence, undo, phases, second edit, and verification are real.
     """
     renderer = RichConsoleRenderer(console)
+    submitted_task = (user_task or RECOVERY_TASK).strip()
+    validate_recovery_task(submitted_task)
     task_dir, task, workspace = _prepare_workspace("recovery_video", "regression_recovery")
     raw_log = io.StringIO()
     with contextlib.redirect_stdout(raw_log), contextlib.redirect_stderr(raw_log):
         tools = RenderingToolExecutor(workspace, renderer)
         planning_client = ScriptedClient([tool_response("submit_plan", recovery_plan(), "recovery-plan")])
-        state = run_planning(task.description, tools, planning_client, max_planning_steps=1)
+        state = run_planning(submitted_task, tools, planning_client, max_planning_steps=1)
         renderer.header(state)
         renderer.planning(state)
         _render_baseline(renderer, state)
@@ -195,11 +204,6 @@ def run_recovery_demo(console: Console | None = None) -> dict[str, Any]:
         failure_recovery = FailureRecovery(tools)
         verification = VerificationEngine(tools, failure_recovery=failure_recovery)
 
-        renderer.decision_summary(
-            "Add optional prefix",
-            "deterministic fixture injects a plausible unconditional-prefix edit",
-            "edit label_tool.py::main",
-        )
         first = tools.call(state, "apply_patch", {
             "file": "label_tool.py", "operation": "replace",
             "intent": "add prefix formatting", "symbol": "main",
@@ -208,6 +212,7 @@ def run_recovery_demo(console: Console | None = None) -> dict[str, Any]:
         _record_tool_event(state, "apply_patch", {}, first, [], True, failure_recovery)
         _transition_tool_result(state, "apply_patch", first, None, orchestrator)
 
+        tools.begin_verification_cycle()
         orchestrator.transition(state, AgentEvent(FINISH_REQUESTED, "fixture edit ready for frozen verification"))
         regressed = verification.run_final_verification(state)
         renderer.verification_summary(regressed)
@@ -217,10 +222,19 @@ def run_recovery_demo(console: Console | None = None) -> dict[str, Any]:
         debug_context = ContextManager(workspace).build_messages(state, "DEBUGGING context preview")[1]["content"]
         if "Current Failure" not in debug_context or "V_DEFAULT" not in debug_context:
             raise RuntimeError("DEBUGGING context did not contain the real regression evidence")
-        renderer.decision_summary(
-            "Repair default behavior after recovery",
-            "baseline V_DEFAULT PASS, current V_DEFAULT FAIL; latest ChangeSet was UNDONE",
-            "apply conditional prefix in label_tool.py::main",
+        baseline_default = next(
+            item["observation"] for item in state.baseline
+            if item["verification_id"] == "V_DEFAULT"
+        )
+        current_default = next(
+            evidence
+            for criterion in regressed.get("criterion_results", [])
+            if criterion.get("criterion_id") == "AC_DEFAULT"
+            for evidence in criterion.get("evidence", [])
+            if evidence.get("verification_id") == "V_DEFAULT"
+        )
+        renderer.debugging_evidence(
+            regressed.get("failure_event"), "V_DEFAULT", baseline_default, current_default,
         )
 
         second = tools.call(state, "apply_patch", {
@@ -231,6 +245,7 @@ def run_recovery_demo(console: Console | None = None) -> dict[str, Any]:
         _record_tool_event(state, "apply_patch", {}, second, [], True, failure_recovery)
         _transition_tool_result(state, "apply_patch", second, None, orchestrator)
 
+        tools.begin_verification_cycle()
         orchestrator.transition(state, AgentEvent(FINISH_REQUESTED, "repaired edit ready for final verification"))
         final = verification.run_final_verification(state)
         renderer.verification_summary(final)
@@ -246,8 +261,20 @@ def run_recovery_demo(console: Console | None = None) -> dict[str, Any]:
     result["first_verification"] = regressed["overall_status"]
     result["recovery_status"] = (regressed.get("recovery_result") or {}).get("status")
     result["debug_context_has_regression_evidence"] = True
+    result["submitted_task"] = submitted_task
     _write_result(workspace.parent, result)
     return result
+
+
+def validate_recovery_task(task: str) -> None:
+    """Keep the deterministic fixture honest about the task it can execute."""
+    normalized = task.lower()
+    missing = [token for token in ("label_tool.py", "--prefix") if token not in normalized]
+    if missing:
+        raise ValueError(
+            "Recovery 演示仅支持固定的 label_tool.py / --prefix regression 场景；"
+            "请直接回车使用默认任务。"
+        )
 
 
 def _render_baseline(renderer: RichConsoleRenderer, state) -> None:
@@ -296,7 +323,7 @@ def parse_args() -> argparse.Namespace:
         "--live-model", action="store_true",
         help="Use the real model for CSV implementation with the benchmark's frozen plan/checks",
     )
-    parser.add_argument("--task", help="Task for --live-model; if omitted, show an interactive prompt")
+    parser.add_argument("--task", help="Task for csv --live-model or the fixed recovery scenario")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors for redirected output")
     return parser.parse_args()
 
@@ -313,7 +340,7 @@ def main() -> int:
     )
     try:
         task = args.task
-        if args.live_model:
+        if args.live_model and args.scenario in {"csv", "all"}:
             env_path = load_project_env()
             if env_path:
                 console.print(f"[dim]模型配置: {env_path.name}[/dim]")
@@ -326,7 +353,17 @@ def main() -> int:
         if args.scenario in {"csv", "all"}:
             run_csv_demo(console, live_model=args.live_model, user_task=task)
         if args.scenario in {"recovery", "all"}:
-            run_recovery_demo(console)
+            recovery_task = task if args.scenario == "recovery" else None
+            if not recovery_task:
+                console.rule("[bold blue]向 Agent 提交任务[/bold blue]")
+                recovery_task = Prompt.ask(
+                    "[bold]请输入任务[/bold]", default=RECOVERY_TASK, console=console,
+                ).strip()
+            if not recovery_task:
+                raise ValueError("task cannot be empty")
+            validate_recovery_task(recovery_task)
+            console.print(f"[blue]用户任务[/blue]  {recovery_task}")
+            run_recovery_demo(console, user_task=recovery_task)
         return 0
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, StopIteration) as exc:
         console.print(f"[red]Demo failed:[/red] {type(exc).__name__}: {exc}")

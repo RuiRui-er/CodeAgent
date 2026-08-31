@@ -5,7 +5,12 @@ from pathlib import Path
 
 from rich.console import Console
 
-from demo_video_cli import load_project_env, run_csv_demo, run_recovery_demo
+from demo_video_cli import (
+    load_project_env,
+    run_csv_demo,
+    run_recovery_demo,
+    validate_recovery_task,
+)
 
 
 class VideoDemoTests(unittest.TestCase):
@@ -26,6 +31,17 @@ class VideoDemoTests(unittest.TestCase):
         self.assertNotIn("hidden_tests", os.listdir(result["workspace"]))
         rendered = stream.getvalue()
         self.assertIn("Verification Contract 已冻结", rendered)
+        self.assertIn("执行计划", rendered)
+        self.assertIn("STEP_PARSE [IMPLEMENT]", rendered)
+        self.assertIn("STEP_MAIN [IMPLEMENT]", rendered)
+        self.assertIn("STEP_VERIFY [VERIFY]", rendered)
+        self.assertIn("实施步骤: 2 · 验证步骤: 1", rendered)
+        self.assertIn("执行: 1/2 · STEP_PARSE", rendered)
+        self.assertIn("执行: 2/2 · STEP_MAIN", rendered)
+        self.assertIn("执行: 2/2 · 修改完成", rendered)
+        self.assertEqual(rendered.count("执行: 2/2 · 修改完成"), 1)
+        self.assertIn("执行: 2/2 · 已完成", rendered)
+        self.assertNotIn("· STEP_VERIFY", rendered)
         self.assertIn("FAIL → PASS", rendered)
         self.assertIn("Stable checkpoint: checkpoint_001", rendered)
 
@@ -41,9 +57,25 @@ class VideoDemoTests(unittest.TestCase):
         self.assertEqual(result["hidden_evaluator"], "PASS")
         self.assertFalse(result["false_success"])
         rendered = stream.getvalue()
+        self.assertNotIn("决策摘要", rendered)
         self.assertIn("PASS → FAIL", rendered)
         self.assertIn("ChangeSet change_0001 UNDONE", rendered)
         self.assertIn("VERIFYING -- VERIFICATION_REGRESSED --> DEBUGGING", rendered)
+        self.assertIn("DEBUGGING 证据", rendered)
+        self.assertIn("REGRESSION_DETECTED", rendered)
+        self.assertIn("regression_detected:v_default:ac_default", rendered)
+        self.assertIn("PASS · stdout: alice", rendered)
+        self.assertIn("FAIL · stdout: :alice", rendered)
+        self.assertGreaterEqual(rendered.count("TARGET · --prefix VIP"), 2)
+        self.assertIn("ChangeSet change_0002", rendered)
+
+    def test_recovery_task_is_recorded_and_unrelated_tasks_are_rejected(self):
+        console, _ = self.console()
+        task = "为 label_tool.py 新增 --prefix TEXT，并保持默认输出。"
+        result = run_recovery_demo(console, user_task=task)
+        self.assertEqual(result["submitted_task"], task)
+        with self.assertRaisesRegex(ValueError, "仅支持固定"):
+            validate_recovery_task("修复 calculator.py 的除法")
 
     def test_dotenv_loader_does_not_override_process_environment(self):
         env_file = Path(".test_workspaces") / "video_demo.env"
